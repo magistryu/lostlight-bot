@@ -5,8 +5,8 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-if not TELEGRAM_TOKEN or not WEBHOOK_URL:
-    raise ValueError("Token or URL missing")
+if not TELEGRAM_TOKEN:
+    raise ValueError("Token missing")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Bot is alive!")
