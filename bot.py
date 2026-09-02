@@ -6,6 +6,7 @@ import hashlib
 import pickle
 import requests
 from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ===== КОНФИГУРАЦИЯ (из переменных окружения Railway) =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
