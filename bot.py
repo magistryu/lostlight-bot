@@ -93,6 +93,7 @@ def init_db():
             target_id TEXT,
             target_name TEXT,
             history TEXT,
+            mode TEXT,
             created_at TEXT,
             last_activity TEXT
         )
@@ -110,6 +111,36 @@ def log_action(user_id, action, target=None, reply=None):
     conn.commit()
     conn.close()
     logger.info(f"LOG: {user_id} -> {action} -> {target}")
+
+def save_session_to_db(user_id, session):
+    """Сохраняет сессию в БД"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "REPLACE INTO sessions (user_id, target_id, target_name, history, mode, created_at, last_activity) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (str(user_id), str(session.get("target_id", "")), str(session.get("target_name", "")),
+         json.dumps(session.get("history", [])), str(session.get("mode", "логик")),
+         session.get("created_at", datetime.now().isoformat()), datetime.now().isoformat())
+    )
+    conn.commit()
+    conn.close()
+
+def load_session_from_db(user_id):
+    """Загружает сессию из БД"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT target_id, target_name, history, mode, created_at FROM sessions WHERE user_id=?", (str(user_id),))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return {
+            "target_id": row[0],
+            "target_name": row[1],
+            "history": json.loads(row[2]) if row[2] else [],
+            "mode": row[3] if row[3] else "логик",
+            "created_at": row[4] if row[4] else datetime.now().isoformat()
+        }
+    return None
 
 # ===== КЭШ =====
 CACHE_PATH = "cache.pkl"
@@ -136,15 +167,13 @@ def queue_request(prompt):
     request_queue.append(prompt)
     if len(request_queue) > 50:
         return "⚠️ Слишком много запросов. Попробуйте позже."
-
     current_time = time.time()
     if current_time - last_request_time < 2:
         time.sleep(2 - (current_time - last_request_time))
-
     last_request_time = time.time()
     return None
 
-# ===== ВЫЗОВ HF (с несколькими моделями) =====
+# ===== ВЫЗОВ HF =====
 def call_hf(prompt, model):
     try:
         url = f"https://api-inference.huggingface.co/models/{model}"
@@ -201,7 +230,6 @@ def call_hf_with_fallback(prompt):
     queue_status = queue_request(prompt)
     if queue_status:
         return queue_status
-
     for model in HF_MODELS:
         logger.info(f"Пробуем HF модель: {model}")
         reply = call_hf(prompt, model)
@@ -210,7 +238,6 @@ def call_hf_with_fallback(prompt):
             return reply
         else:
             logger.warning(f"❌ HF модель {model} не ответила")
-
     if OPENROUTER_KEY:
         logger.info("Пробуем OpenRouter...")
         reply = call_openrouter(prompt)
@@ -219,11 +246,10 @@ def call_hf_with_fallback(prompt):
             return reply
         else:
             logger.warning("❌ OpenRouter не ответил")
-
     logger.warning("Все модели не ответили. Ответ не будет отправлен.")
     return None
 
-# ===== ИЗВЛЕЧЕНИЕ ИМЁН (УЛУЧШЕННОЕ) =====
+# ===== ИЗВЛЕЧЕНИЕ ИМЁН =====
 STOP_WORDS = {"я", "ты", "он", "она", "оно", "мы", "вы", "они", "меня", "тебя", "себя",
               "слабость", "сила", "кда", "скилл", "глуп", "туп", "ум", "возраст", "старый", "молод",
               "fuck", "why", "because", "nigga", "man", "stuff", "body", "mother", "fucker",
@@ -271,7 +297,7 @@ banned_players = {}
 last_message_time = {}
 session_data = {}
 
-# ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
+# ===== КНОПКИ =====
 def get_main_keyboard():
     keyboard = [
         [
@@ -321,7 +347,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(user_id) in banned_players:
         return
 
-    # ===== ОТЛОЖЕННЫЙ ОТВЕТ (ЗАДЕРЖКА) =====
+    # Задержка
     last_time = last_message_time.get(user_id, 0)
     if time.time() - last_time < 3:
         await asyncio.sleep(3 - (time.time() - last_time))
@@ -335,8 +361,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 forwarded_msg = await context.bot.forward_message(
                     chat_id=message.chat.id,
-
-                  message_id=message.forward_from_message_id
+                    from_chat_id=message.forward_from_chat.id if message.forward_from_chat else message.chat.id,
+                    message_id=message.forward_from_message_id
                 )
                 text = forwarded_msg.text
             except:
@@ -347,31 +373,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # ===== АНАЛИЗ КОНТЕКСТА =====
-    context_analysis = analyze_context(text)
-
-    # ===== СЕССИЯ: ПРОВЕРКА НА АКТИВНОСТЬ =====
-    if user_id in session_data:
-        session = session_data[user_id]
-        if not session.get("target_id"):
-            await auto_detect_target(update, context, text)
-            return
-        if text.lower().startswith("/stop"):
-            await stop_session(update, context)
-            return
-        if is_offensive(text):
-            degree = calculate_degree(text)
-            if degree >= 5:
-                await generate_response(update, context, text)
-                return
-            else:
-                await update.message.reply_text(f"📊 Градус: {degree}/10. Пока не критично.")
-                return
-        else:
-            await update.message.reply_text("ℹ️ В сообщении нет оскорблений. Продолжаю наблюдение.")
+    # Если пользователь ответил на вопрос "С кем я общаюсь?"
+    if user_id in user_sessions and user_sessions[user_id].get("step") == "waiting_target":
+        target_name = text.strip()
+        if target_name:
+            session_data[user_id] = {
+                "target_id": target_name,
+                "target_name": target_name,
+                "history": [],
+                "mode": "логик",
+                "created_at": datetime.now().isoformat()
+            }
+            save_session_to_db(user_id, session_data[user_id])
+            del user_sessions[user_id]
+            await update.message.reply_text(
+                f"🎯 Цель установлена: {target_name}\n\n"
+                "Теперь пересылайте мне сообщения оппонента, и я буду анализировать их.",
+                reply_markup=get_main_keyboard()
+            )
             return
 
-    # ===== НОВАЯ СЕССИЯ =====
+    # Проверка на команду остановки
+    if text.lower().startswith("/stop"):
+        await stop_session(update, context)
+        return
+
+    # Проверка на команду target
     if text.lower().startswith("/target"):
         parts = text.split(maxsplit=1)
         if len(parts) > 1:
@@ -381,8 +408,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "target_name": target_name,
                 "history": [],
                 "mode": "логик",
-                "created_at": datetime.now()
+                "created_at": datetime.now().isoformat()
             }
+            save_session_to_db(user_id, session_data[user_id])
             await update.message.reply_text(
                 f"🎯 Цель установлена: {target_name}\n\n"
                 "Теперь пересылайте мне сообщения оппонента, и я буду анализировать их.",
@@ -390,7 +418,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    await auto_detect_target(update, context, text)
+    # Если есть активная сессия
+    if user_id in session_data:
+        session = session_data[user_id]
+        if not session.get("target_id"):
+            await update.message.reply_text("👤 С кем я общаюсь? Напишите имя цели.")
+            user_sessions[user_id] = {"step": "waiting_target"}
+            return
+
+        # Режим "Всегда отвечать" (если включён)
+        always_reply = context.user_data.get("always_reply", False)
+        if is_offensive(text) or always_reply:
+            await generate_response(update, context, text)
+            return
+        else:
+            degree = calculate_degree(text)
+            if degree >= 5:
+                await generate_response(update, context, text)
+                return
+            else:
+                await update.message.reply_text(f"📊 Градус: {degree}/10. Пока не критично.")
+                return
+
+    # Новая сессия — автоопределение цели
+    if not user_id in session_data:
+        await auto_detect_target(update, context, text)
 
 async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
@@ -403,21 +455,21 @@ async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
             "target_name": target_name,
             "history": [],
             "mode": "логик",
-            "created_at": datetime.now()
+            "created_at": datetime.now().isoformat()
         }
+        save_session_to_db(user_id, session_data[user_id])
         await update.message.reply_text(
             f"🎯 Я определил цель: {target_name}\n\n"
             "Это правильный игрок? (Если нет — используйте кнопку «Сменить цель»)",
             reply_markup=get_main_keyboard()
         )
-        return
     else:
         await update.message.reply_text(
             "❌ Не удалось определить цель.\n"
-            "Укажите имя вручную: /target <имя>\n"
-            "Или нажмите кнопку «Сменить цель».",
+            "Напишите имя вручную, или я спрошу вас позже.",
             reply_markup=get_main_keyboard()
         )
+        user_sessions[user_id] = {"step": "waiting_target"}
 
 async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
@@ -425,13 +477,14 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     if not session:
         return
 
-    target_id = session.get("target_id")
     target_name = session.get("target_name")
     mode = session.get("mode", "логик")
 
+    # Сохраняем в историю
     session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
     if len(session["history"]) > 20:
         session["history"] = session["history"][-20:]
+    save_session_to_db(user_id, session)
 
     styles = {
         "логик": "логический анализ, разбор аргументов",
@@ -447,6 +500,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
         f"Сообщение: \"{text}\". Режим: {mode} ({styles.get(mode, mode)}). "
         f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
+        f"Сделай ответ максимально колким, логичным и неожиданным. "
         f"Твоя задача: сгенерировать 3 варианта ответа (до 20 слов каждый), "
         f"которые уничтожат оппонента, используя его же логику. "
         f"Варианты:"
@@ -465,6 +519,18 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     context.user_data["last_options"] = options
     context.user_data["last_prompt"] = prompt
+
+    # Стратегии
+    strategies = [
+        "Сейчас лучше ответить холодно — он потеряет контроль.",
+        "Используй сарказм — он не выдержит насмешки.",
+        "Бей в логику — у него нет аргументов.",
+        "Спровоцируй его на эмоции — он ошибётся.",
+        "Ответь зеркально — он увидит себя со стороны.",
+        "Используй абсурд — он не поймёт, как реагировать.",
+        "Покажи статистику — это его слабое место."
+    ]
+    strategy = random.choice(strategies)
 
     keyboard = [
         [
@@ -486,6 +552,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"1️⃣ {options[0]}\n"
         f"2️⃣ {options[1]}\n"
         f"3️⃣ {options[2]}\n\n"
+        f"💡 Стратегия: {strategy}\n\n"
         f"Выберите вариант или сгенерируйте новый:",
         reply_markup=reply_markup
     )
@@ -569,6 +636,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = data.replace("mode_", "")
         if user_id in session_data:
             session_data[user_id]["mode"] = mode
+            save_session_to_db(user_id, session_data[user_id])
         mode_names = {
             "logic": "Логик",
             "mirror": "Зеркало",
@@ -658,6 +726,8 @@ async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in session_data:
         del session_data[user_id]
+    if user_id in user_sessions:
+        del user_sessions[user_id]
     await update.message.reply_text(
         "⏹ Сессия завершена.\nДанные сохранены в историю диалогов.",
         reply_markup=get_main_keyboard()
@@ -689,8 +759,9 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "target_name": target_name,
             "history": [],
             "mode": "логик",
-            "created_at": datetime.now()
+            "created_at": datetime.now().isoformat()
         }
+        save_session_to_db(user_id, session_data[user_id])
         await update.message.reply_text(
             f"🎯 Цель установлена: {target_name}\n\n"
             "Теперь пересылайте мне сообщения оппонента, и я буду анализировать их.",
