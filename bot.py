@@ -360,7 +360,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text.lower() == "/done":
             full_text = "\n".join(user_chat_collection[user_id])
             del user_chat_collection[user_id]
-            await process_text(update, full_text)
+            await process_text(update, context, full_text)  # <-- ИСПРАВЛЕНО
             return
         else:
             user_chat_collection[user_id].append(text)
@@ -376,11 +376,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
         return
 
-    await process_text(update, text)
+    await process_text(update, context, text)  # <-- ИСПРАВЛЕНО
 
-async def process_text(update: Update, text: str):
+# ===== ОСНОВНАЯ ЛОГИКА АНАЛИЗА ТЕКСТА =====
+async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):  # <-- ДОБАВЛЕН context
     user_id = update.effective_user.id
-    auto_mode = update.effective_user.id in context.user_data and context.user_data.get("auto_mode", False)
+    auto_mode = context.user_data.get("auto_mode", False)  # <-- ИСПРАВЛЕНО
 
     alias = extract_aliases(text)
     if alias:
