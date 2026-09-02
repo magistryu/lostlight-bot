@@ -1,8 +1,24 @@
-print("Starting bot...")
 import os
-print("OS imported")
 from telegram import Update
-print("telegram imported")
 from telegram.ext import Application, CommandHandler, ContextTypes
-print("telegram.ext imported")
-print("All imports OK")
+
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+
+if not TELEGRAM_TOKEN or not WEBHOOK_URL:
+    raise ValueError("Token or URL missing")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot is alive!")
+
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=int(os.getenv("PORT", 8080)),
+        webhook_url=WEBHOOK_URL + "/webhook"
+    )
+
+if __name__ == "__main__":
+    main()
