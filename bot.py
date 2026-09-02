@@ -298,10 +298,33 @@ def find_mentioned_player(text):
 user_sessions = {}
 user_chat_collection = {}
 
-# ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
+# ===== ОБРАБОТЧИК СООБЩЕНИЙ (ИСПРАВЛЕННЫЙ) =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    text = update.message.text
+    message = update.message
+
+    if not message:
+        return
+
+    # === ОБРАБОТКА ПЕРЕСЛАННЫХ СООБЩЕНИЙ ===
+    text = None
+    if message.text:
+        text = message.text
+    elif message.forward_from or message.forward_from_chat:
+        # Если переслано — берём текст из оригинального сообщения
+        if message.forward_from_message_id:
+            # Пытаемся получить текст из пересланного
+            try:
+                forwarded_msg = await context.bot.forward_message(
+                    chat_id=message.chat.id,
+                    from_chat_id=message.forward_from_chat.id if message.forward_from_chat else message.chat.id,
+                    message_id=message.forward_from_message_id
+                )
+                text = forwarded_msg.text
+            except:
+                text = "⚠️ Не удалось получить текст пересланного сообщения."
+        else:
+            text = "⚠️ Пересланное сообщение без текста."
 
     if not text:
         return
@@ -455,7 +478,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Укажите ID или имя: /stats <ID_игрока> или /stats <имя>")
         return
     query = context.args[0]
-    conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT player_id FROM aliases WHERE alias=?", (query,))
     row = c.fetchone()
