@@ -5,6 +5,7 @@ import sqlite3
 import hashlib
 import pickle
 import requests
+import time  # <-- ДОБАВЛЕНО для задержки
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -64,6 +65,8 @@ def call_hf(prompt):
         }
     }
     try:
+        # ===== ПУНКТ 3: ЗАДЕРЖКА МЕЖДУ ЗАПРОСАМИ =====
+        time.sleep(1)  # Чтобы не превышать лимит HuggingFace (30 запросов в минуту)
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
@@ -150,10 +153,14 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
         f"Ответ:"
     )
 
-    # 6. Зовём HF или берём fallback
+    # ===== ПУНКТ 4: ЛОГИРОВАНИЕ ВЫЗОВА HF =====
+    print("Вызов HF...")
     reply = call_hf(prompt)
+    print("Ответ HF:", reply)  # Будет None, если HF не отвечает
+
     if not reply:
         reply = get_fallback(attack_text)
+        print("Использована запасная фраза:", reply)
 
     # 7. Обрезаем до 30 слов (приблизительно)
     words = reply.split()
