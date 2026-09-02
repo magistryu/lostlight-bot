@@ -10,6 +10,8 @@ import logging
 import random
 import csv
 import io
+import asyncio
+import requests
 from datetime import datetime, timedelta
 from collections import deque
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -32,6 +34,7 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 HF_MODELS = os.getenv("HF_MODELS", "google/flan-t5-small")
 HF_MODELS = [m.strip() for m in HF_MODELS.split(",") if m.strip()]
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", None)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", None)  # <-- НОВОЕ: для голосовых
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -83,6 +86,16 @@ def init_db():
             id TEXT PRIMARY KEY,
             reason TEXT,
             timestamp TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            user_id TEXT PRIMARY KEY,
+            target_id TEXT,
+            target_name TEXT,
+            history TEXT,
+            created_at TEXT,
+            last_activity TEXT
         )
     """)
     conn.commit()
@@ -190,7 +203,6 @@ def call_hf_with_fallback(prompt):
     if queue_status:
         return queue_status
 
-    # 1. Пробуем HF модели
     for model in HF_MODELS:
         logger.info(f"Пробуем HF модель: {model}")
         reply = call_hf(prompt, model)
@@ -200,7 +212,6 @@ def call_hf_with_fallback(prompt):
         else:
             logger.warning(f"❌ HF модель {model} не ответила")
 
-    # 2. Пробуем OpenRouter
     if OPENROUTER_KEY:
         logger.info("Пробуем OpenRouter...")
         reply = call_openrouter(prompt)
@@ -210,14 +221,18 @@ def call_hf_with_fallback(prompt):
         else:
             logger.warning("❌ OpenRouter не ответил")
 
-    # 3. Если ничего не сработало — возвращаем None (без Fallback)
     logger.warning("Все модели не ответили. Ответ не будет отправлен.")
     return None
 
 # ===== ИЗВЛЕЧЕНИЕ ИМЁН (УЛУЧШЕННОЕ) =====
 STOP_WORDS = {"я", "ты", "он", "она", "оно", "мы", "вы", "они", "меня", "тебя", "себя",
               "слабость", "сила", "кда", "скилл", "глуп", "туп", "ум", "возраст", "старый", "молод",
-              "fuck", "why", "because", "nigga", "man", "stuff", "body", "mother", "fucker"}
+              "fuck", "why", "because", "nigga", "man", "stuff", "body", "mother", "fucker",
+              "твоей", "твоя", "твоё", "его", "её", "вашей", "ваше", "своей"}
+
+OFFENSIVE_WORDS = ["мам", "дурак", "лох", "идиот", "тупой", "гандон", "дебил", 
+                   "fuck", "nigga", "mother", "fucker", "хуй", "хуя", "пизда", 
+                   "бля", "еб", "ебал", "шлюха", "сука", "блять"]
 
 def extract_aliases(text):
     patterns = [
@@ -247,8 +262,30 @@ def find_mentioned_player(text):
     return None, None
 
 def is_offensive(text):
-    offensive_words = ["мам", "дурак", "лох", "идиот", "тупой", "гандон", "дебил", "fuck", "nigga", "mother", "fucker"]
-    return any(word in text.lower() for word in offensive_words)
+    return any(word in text.lower() for word in OFFENSIVE_WORDS)
+
+# ===== РАСПОЗНАВАНИЕ ГОЛОСОВЫХ СООБЩЕНИЙ (через Groq Whisper API) =====
+async def transcribe_voice(file_path):
+    """Отправляет аудиофайл в Groq Whisper API и возвращает текст"""
+    if not GROQ_API_KEY:
+        logger.warning("GROQ_API_KEY не задан")
+        return None
+    try:
+        url = "https://api.groq.com/openai/v1/audio/transcriptions"
+        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+        with open(file_path, "rb") as f:
+            files = {"file": f}
+            data = {"model": "whisper-large-v3", "language": "ru"}
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=30)
+            if resp.status_code == 200:
+                result = resp.json()
+                return result.get("text", "").strip()
+            else:
+                logger.warning(f"Groq returned {resp.status_code}: {resp.text}")
+                return None
+    except Exception as e:
+        logger.warning(f"Groq Whisper failed: {e}")
+        return None
 
 # ===== ХРАНЕНИЕ СОСТОЯНИЙ =====
 user_sessions = {}
@@ -256,6 +293,46 @@ user_chat_collection = {}
 dialog_histories = {}
 banned_players = {}
 last_message_time = {}
+session_data = {}  # user_id -> {"target_id": ..., "target_name": ..., "history": [], "mode": "логик"}
+
+# ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
+def get_main_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🎯 Сменить цель", callback_data="action_change_target"),
+            InlineKeyboardButton("🎭 Режим", callback_data="action_mode")
+        ],
+        [
+            InlineKeyboardButton("📊 Градус", callback_data="action_degree"),
+            InlineKeyboardButton("📤 Экспорт", callback_data="action_export")
+        ],
+        [
+            InlineKeyboardButton("⏹ Завершить сессию", callback_data="action_stop"),
+            InlineKeyboardButton("❓ Помощь", callback_data="action_help")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_mode_keyboard():
+    keyboard = [
+        [
+            InlineKeyboardButton("🧠 Логик", callback_data="mode_logic"),
+            InlineKeyboardButton("🪞 Зеркало", callback_data="mode_mirror")
+        ],
+        [
+            InlineKeyboardButton("😏 Сарказм", callback_data="mode_sarcasm"),
+            InlineKeyboardButton("🔥 Провокатор", callback_data="mode_provocator")
+        ],
+        [
+            InlineKeyboardButton("🧐 Психолог", callback_data="mode_psychologist"),
+            InlineKeyboardButton("🌀 Хаос", callback_data="mode_chaos")
+        ],
+        [
+            InlineKeyboardButton("📊 Статистик", callback_data="mode_statistic"),
+            InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+        ]
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
 # ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -265,15 +342,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
 
-    # Проверяем, не забанен ли пользователь
     if str(user_id) in banned_players:
         return
 
     # ===== ОТЛОЖЕННЫЙ ОТВЕТ (ЗАДЕРЖКА) =====
     last_time = last_message_time.get(user_id, 0)
-    if time.time() - last_time < 5:
-        await asyncio.sleep(5 - (time.time() - last_time))
+    if time.time() - last_time < 3:
+        await asyncio.sleep(3 - (time.time() - last_time))
     last_message_time[user_id] = time.time()
+
+    # ===== ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ =====
+    if message.voice:
+        await update.message.reply_text("🎤 Распознаю голосовое сообщение...")
+        try:
+            file = await context.bot.get_file(message.voice.file_id)
+            file_path = f"voice_{user_id}_{int(time.time())}.ogg"
+            await file.download_to_drive(file_path)
+            text = await transcribe_voice(file_path)
+            os.remove(file_path)
+            if text:
+                await update.message.reply_text(f"📝 Распознано: \"{text}\"")
+                # Подставляем распознанный текст в обработку
+                message.text = text
+            else:
+                await update.message.reply_text("❌ Не удалось распознать голосовое сообщение.")
+                return
+        except Exception as e:
+            logger.error(f"Voice processing error: {e}")
+            await update.message.reply_text("❌ Ошибка при обработке голосового сообщения.")
+            return
 
     text = None
     if message.text:
@@ -295,52 +392,174 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # ===== АНАЛИЗ КОНТЕКСТА (ЭМОДЗИ, ДЛИНА, КАПС) =====
+    # ===== АНАЛИЗ КОНТЕКСТА =====
     context_analysis = analyze_context(text)
 
-    if user_id in user_sessions:
-        if datetime.now() - user_sessions[user_id].get("created_at", datetime.now()) > timedelta(minutes=10):
-            del user_sessions[user_id]
-            await update.message.reply_text("⏰ Сессия устарела. Начните заново.")
+    # ===== СЕССИЯ: ПРОВЕРКА НА АКТИВНОСТЬ =====
+    if user_id in session_data:
+        session = session_data[user_id]
+        # Если цель не определена — пытаемся определить
+        if not session.get("target_id"):
+            await auto_detect_target(update, context, text)
             return
-
-    if user_id in user_chat_collection:
-        if text.lower() == "/done":
-            full_text = "\n".join(user_chat_collection[user_id])
-            del user_chat_collection[user_id]
-            await process_text(update, context, full_text, context_analysis)
+        # Если цель определена — анализируем
+        if text.lower().startswith("/stop"):
+            await stop_session(update, context)
             return
+        # Проверка на оскорбления
+        if is_offensive(text):
+            degree = calculate_degree(text)
+            if degree >= 5:
+                await generate_response(update, context, text)
+                return
+            else:
+                await update.message.reply_text(f"📊 Градус: {degree}/10. Пока не критично.")
+                return
         else:
-            user_chat_collection[user_id].append(text)
-            await update.message.reply_text(f"📝 Сообщение добавлено. Всего: {len(user_chat_collection[user_id])}. Напишите /done, когда закончите.")
+            await update.message.reply_text("ℹ️ В сообщении нет оскорблений. Продолжаю наблюдение.")
             return
 
-    if text.lower() == "/done":
-        await update.message.reply_text("❌ Вы не в режиме сбора переписки. Напишите /chat чтобы начать.")
-        return
-
-    if text.lower().startswith("/auto"):
-        context.user_data["auto_mode"] = True
-        await update.message.reply_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
-        return
-
-    if text.lower().startswith("/test"):
-        # ===== ТЕСТОВЫЙ РЕЖИМ =====
-        await update.message.reply_text("🧪 Тестовый режим: я бы ответил так:")
-        await process_text(update, context, text, context_analysis)
-        return
-
-    if text.lower().startswith("/ban") and update.effective_user.id in [YOUR_ADMIN_ID]:
-        parts = text.split()
+    # ===== НОВАЯ СЕССИЯ =====
+    # Проверяем, есть ли в тексте явное указание на цель (через команду или контекст)
+    if text.lower().startswith("/target"):
+        parts = text.split(maxsplit=1)
         if len(parts) > 1:
-            banned_players[parts[1]] = {"reason": " ".join(parts[2:]), "timestamp": datetime.now()}
-            await update.message.reply_text(f"🚫 Игрок {parts[1]} забанен.")
+            target_name = parts[1].strip()
+            session_data[user_id] = {
+                "target_id": target_name,
+                "target_name": target_name,
+                "history": [],
+                "mode": "логик",
+                "created_at": datetime.now()
+            }
+            await update.message.reply_text(
+                f"🎯 Цель установлена: {target_name}\n\n"
+                "Теперь пересылайте мне сообщения оппонента, и я буду анализировать их.",
+                reply_markup=get_main_keyboard()
+            )
+            return
+
+    # Пытаемся автоматически определить цель
+    await auto_detect_target(update, context, text)
+
+async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Автоматически определяет цель по первому сообщению"""
+    user_id = update.effective_user.id
+    # Ищем имя в тексте
+    potential_names = re.findall(r'\b([A-Za-zА-ЯЁа-яё0-9_\-]+)\b', text)
+    candidates = [name for name in potential_names if name.lower() not in STOP_WORDS]
+    if candidates:
+        target_name = candidates[0]
+        session_data[user_id] = {
+            "target_id": target_name,
+            "target_name": target_name,
+            "history": [],
+            "mode": "логик",
+            "created_at": datetime.now()
+        }
+        await update.message.reply_text(
+            f"🎯 Я определил цель: {target_name}\n\n"
+            "Это правильный игрок? (Если нет — используйте кнопку «Сменить цель»)",
+            reply_markup=get_main_keyboard()
+        )
+        return
+    else:
+        await update.message.reply_text(
+            "❌ Не удалось определить цель.\n"
+            "Укажите имя вручную: /target <имя>\n"
+            "Или нажмите кнопку «Сменить цель».",
+            reply_markup=get_main_keyboard()
+        )
+
+async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Генерирует 3 варианта ответа"""
+    user_id = update.effective_user.id
+    session = session_data.get(user_id)
+    if not session:
         return
 
-    await process_text(update, context, text, context_analysis)
+    target_id = session.get("target_id")
+    target_name = session.get("target_name")
+    mode = session.get("mode", "логик")
+
+    # Сохраняем в историю
+    session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
+    if len(session["history"]) > 20:
+        session["history"] = session["history"][-20:]
+
+    # Генерируем ответы
+    styles = {
+        "логик": "логический анализ, разбор аргументов",
+        "зеркало": "копирование стиля с переворотом смысла",
+        "сарказм": "уничтожение через иронию",
+        "провокатор": "вызов эмоций, провокация",
+        "психолог": "анализ поведения с юмором",
+        "хаос": "абсурдные, но логически связанные ответы",
+        "статистик": "статистика по оппоненту"
+    }
+
+    prompt = (
+        f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
+        f"Сообщение: \"{text}\". Режим: {mode} ({styles.get(mode, mode)}). "
+        f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
+        f"Твоя задача: сгенерировать 3 варианта ответа (до 20 слов каждый), "
+        f"которые уничтожат оппонента, используя его же логику. "
+        f"Варианты:"
+    )
+
+    reply = call_hf_with_fallback(prompt)
+    if not reply:
+        await update.message.reply_text("⚠️ Не удалось сгенерировать ответ. Попробуйте позже.")
+        return
+
+    # Разбиваем на варианты (если есть)
+    options = reply.split("\n")
+    options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
+    if len(options) < 3:
+        options = options + ["Вариант 1: " + reply, "Вариант 2: " + reply, "Вариант 3: " + reply]
+    options = options[:3]
+
+    # Сохраняем последние варианты для кнопки "Ещё"
+    context.user_data["last_options"] = options
+    context.user_data["last_prompt"] = prompt
+
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Вариант 1", callback_data=f"choose_0"),
+            InlineKeyboardButton("📝 Вариант 2", callback_data=f"choose_1"),
+            InlineKeyboardButton("📝 Вариант 3", callback_data=f"choose_2")
+        ],
+        [
+            InlineKeyboardButton("🔄 Ещё вариант", callback_data="action_more"),
+            InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"🎯 Цель: {target_name} | Режим: {mode}\n\n"
+        f"📊 Градус: {calculate_degree(text)}/10\n\n"
+        f"**Варианты ответа:**\n"
+        f"1️⃣ {options[0]}\n"
+        f"2️⃣ {options[1]}\n"
+        f"3️⃣ {options[2]}\n\n"
+        f"Выберите вариант или сгенерируйте новый:",
+        reply_markup=reply_markup
+    )
+
+def calculate_degree(text):
+    """Оценивает градус напряжённости от 0 до 10"""
+    score = 0
+    for word in OFFENSIVE_WORDS:
+        if word in text.lower():
+            score += 2
+    if len(text) > 50:
+        score += 1
+    if text.isupper():
+        score += 1
+    return min(10, score)
 
 def analyze_context(text):
-    """Анализирует контекст сообщения (эмодзи, длина, капс)"""
     emojis = re.findall(r'[\U0001F600-\U0001F64F]', text)
     caps = sum(1 for c in text if c.isupper())
     length = len(text)
@@ -352,400 +571,216 @@ def analyze_context(text):
         "is_long": length > 60
     }
 
-# ===== ОСНОВНАЯ ЛОГИКА АНАЛИЗА ТЕКСТА =====
-async def process_text(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, context_analysis=None):
-    user_id = update.effective_user.id
-    auto_mode = context.user_data.get("auto_mode", False)
-
-    if not is_offensive(text):
-        await update.message.reply_text("ℹ️ В переписке не обнаружено оскорблений.")
-        return
-
-    # Сохраняем в историю диалога
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO dialog_history (aggressor_id, message, timestamp) VALUES (?, ?, ?)",
-              (str(user_id), text, datetime.now().isoformat()))
-    conn.commit()
-    conn.close()
-
-    alias = extract_aliases(text)
-    if alias:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("INSERT OR IGNORE INTO aliases (player_id, alias) VALUES (?, ?)", (str(update.effective_user.id), alias))
-        conn.commit()
-        conn.close()
-        await update.message.reply_text(f"👤 Запомнил: {alias} (это вы)")
-        log_action(user_id, "self_identify", alias)
-
-    potential_names = re.findall(r'\b([A-Za-zА-ЯЁа-яё0-9_\-]+)\b', text)
-    candidates = [name for name in potential_names if name.lower() not in STOP_WORDS]
-    mentioned_id, mentioned_alias = find_mentioned_player(text)
-
-    # ===== ДИНАМИЧЕСКАЯ СТАТИСТИКА =====
-    if mentioned_id:
-        stats = get_player_stats(mentioned_id)
-        if stats:
-            await update.message.reply_text(f"📊 Статистика по {mentioned_alias}: {stats}")
-
-    # ===== РЕЖИМ "ТЕНЬ" (ПАССИВНАЯ АГРЕССИЯ) =====
-    if mentioned_id and auto_mode:
-        reply = generate_reply(text, mentioned_id)
-        await update.message.reply_text(f"🎯 Цель: {mentioned_alias}\n\n{reply}")
-        log_action(user_id, "auto_reply", mentioned_alias, reply)
-        return
-
-    if mentioned_id and not auto_mode:
-        user_sessions[user_id] = {
-            "step": "waiting_confirmation",
-            "candidates": [mentioned_alias],
-            "original_text": text,
-            "created_at": datetime.now()
-        }
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Да", callback_data=f"confirm_{mentioned_alias}"),
-                InlineKeyboardButton("❌ Нет", callback_data=f"deny_{mentioned_alias}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"🤔 Я нашёл цель: **{mentioned_alias}**.\n"
-            f"Это правильный игрок? (Нажмите кнопку или напишите 'да' / 'нет, это <имя>')",
-            reply_markup=reply_markup
-        )
-        log_action(user_id, "ask_confirmation", mentioned_alias)
-        return
-
-    if candidates and not auto_mode:
-        candidate = candidates[0]
-        user_sessions[user_id] = {
-            "step": "waiting_confirmation",
-            "candidates": [candidate],
-            "original_text": text,
-            "created_at": datetime.now()
-        }
-        keyboard = [
-            [
-                InlineKeyboardButton("✅ Да", callback_data=f"confirm_{candidate}"),
-                InlineKeyboardButton("❌ Нет", callback_data=f"deny_{candidate}")
-            ]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.message.reply_text(
-            f"🤔 Я нашёл возможную цель: **{candidate}**.\n"
-            f"Это правильный игрок? (Нажмите кнопку или напишите 'да' / 'нет, это <имя>')",
-            reply_markup=reply_markup
-        )
-        log_action(user_id, "ask_confirmation", candidate)
-        return
-
-    if auto_mode and candidates:
-        candidate = candidates[0]
-        reply = generate_reply(text, candidate)
-        await update.message.reply_text(f"🎯 Цель: {candidate}\n\n{reply}")
-        log_action(user_id, "auto_reply", candidate, reply)
-        return
-
-    await update.message.reply_text("❌ Не удалось определить цель. Напишите /chat, чтобы отправить переписку частями, или укажите имя явно.")
-
-def get_player_stats(player_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT total_attacks, weak_points, success_count FROM aggressors WHERE id=?", (player_id,))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        total, weak, success = row
-        return f"Всего атак: {total}, Слабые места: {weak}, Успешных ударов: {success}"
-    return None
-
-# ===== ГЕНЕРАЦИЯ ОТВЕТА (С АДАПТИВНЫМ СТИЛЕМ) =====
-def generate_reply(attack_text: str, agg_id: str) -> str:
-    key = get_cache_key(attack_text, agg_id)
-    if key in CACHE:
-        return CACHE[key]
-
-    # ===== АДАПТИВНЫЙ СТИЛЬ =====
-    style = select_style(attack_text, agg_id)
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT history, weak_points, style_used, total_attacks FROM aggressors WHERE id=?", (agg_id,))
-    row = c.fetchone()
-    history = []
-    weak = "неизвестно"
-    total_attacks = 0
-    if row:
-        history = json.loads(row[0]) if row[0] else []
-        weak = row[1] if row[1] else "неизвестно"
-        total_attacks = row[3] if row[3] else 0
-
-    attack_lower = attack_text.lower()
-    if "мам" in attack_lower or "мать" in attack_lower:
-        target = "семья"
-    elif "играть" in attack_lower or "скилл" in attack_lower or "кда" in attack_lower:
-        target = "скилл"
-    elif "глуп" in attack_lower or "туп" in attack_lower or "ум" in attack_lower:
-        target = "интеллект"
-    elif "возраст" in attack_lower or "старый" in attack_lower or "молод" in attack_lower:
-        target = "возраст"
-    else:
-        target = "общее"
-
-    if weak == "неизвестно":
-        weak = target
-    elif target not in weak:
-        weak += f",{target}"
-
-    prompt = (
-        f"Ты — бот для контр-атак в игровом чате. Противник написал: \"{attack_text}\". "
-        f"Его слабые места: {weak}. Твой стиль: {style}. "
-        f"Это его {total_attacks + 1}-я атака. "
-        f"Твоя задача: ответить до 30 слов, используя его же логику и лексику, но перевернуть смысл так, "
-        f"чтобы противник оправдывался или выглядел глупо. Не используй прямые оскорбления без причины. "
-        f"Ответ:"
-    )
-
-    reply = call_hf_with_fallback(prompt)
-    if not reply:
-        return "⚠️ Не удалось сгенерировать ответ. Попробуйте позже."
-
-    words = reply.split()
-    if len(words) > 30:
-        reply = " ".join(words[:30]) + "..."
-
-    # Сохраняем историю
-    history.append({"attack": attack_text, "reply": reply})
-    if len(history) > 20:
-        history = history[-20:]
-
-    c.execute(
-        "REPLACE INTO aggressors (id, history, weak_points, style_used, success_count, total_attacks) VALUES (?,?,?,?,?,?)",
-        (agg_id, json.dumps(history), weak, style, 0, total_attacks + 1)
-    )
-    conn.commit()
-    conn.close()
-
-    CACHE[key] = reply
-    save_cache()
-    return reply
-
-def select_style(attack_text: str, agg_id: str) -> str:
-    """Выбирает стиль ответа на основе истории и контекста"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT total_attacks FROM aggressors WHERE id=?", (agg_id,))
-    row = c.fetchone()
-    total = row[0] if row else 0
-    conn.close()
-
-    length = len(attack_text)
-    if total > 5:
-        return "холодный"
-    elif length < 30:
-        return "зеркало"
-    elif length > 60:
-        return "логический"
-    else:
-        return "гибрид"
-
-# ===== ЭКСПОРТ СТАТИСТИКИ =====
-async def export_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT id, total_attacks, weak_points, success_count FROM aggressors")
-    rows = c.fetchall()
-    conn.close()
-
-    if not rows:
-        await update.message.reply_text("ℹ️ Нет данных для экспорта.")
-        return
-
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["ID", "Total Attacks", "Weak Points", "Success Count"])
-    writer.writerows(rows)
-
-    await update.message.reply_document(
-        document=io.BytesIO(output.getvalue().encode()),
-        filename="stats.csv",
-        caption="📊 Статистика агрессоров"
-    )
-
-# ===== ОБРАБОТЧИК КНОПОК =====
+# ===== ОБРАБОТЧИК КНОПОК (CallbackQuery) =====
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     data = query.data
 
-    if data.startswith("confirm_"):
-        candidate = data.replace("confirm_", "")
-        if user_id in user_sessions:
-            original_text = user_sessions[user_id].get("original_text", "")
-            reply = generate_reply(original_text, candidate)
-            await query.edit_message_text(f"🎯 Цель подтверждена: {candidate}\n\n{reply}")
-            log_action(user_id, "confirm_reply", candidate, reply)
-            del user_sessions[user_id]
-    elif data.startswith("deny_"):
-        candidate = data.replace("deny_", "")
-        await query.edit_message_text(
-            f"❌ Отмена. Укажите имя вручную: напишите 'нет, это <имя>'"
-        )
+    # ===== ВЫБОР ВАРИАНТА ОТВЕТА =====
+    if data.startswith("choose_"):
+        idx = int(data.replace("choose_", ""))
+        options = context.user_data.get("last_options", [])
+        if idx < len(options):
+            await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
+            # Можно добавить кнопку "Отправить в чат" или "Копировать"
+        return
 
-# ===== КОМАНДЫ =====
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [
-            InlineKeyboardButton("📝 Новая переписка", callback_data="action_chat"),
-            InlineKeyboardButton("⚡ Авторежим", callback_data="action_auto")
-        ],
-        [
-            InlineKeyboardButton("🗑 Стереть всё", callback_data="action_reset_all"),
-            InlineKeyboardButton("📊 Статистика", callback_data="action_stats")
-        ],
-        [
-            InlineKeyboardButton("📤 Экспорт CSV", callback_data="action_export"),
-            InlineKeyboardButton("❓ Помощь", callback_data="action_help")
-        ]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    # ===== ЕЩЁ ВАРИАНТ =====
+    if data == "action_more":
+        prompt = context.user_data.get("last_prompt", "")
+        if prompt:
+            reply = call_hf_with_fallback(prompt + " Дай ещё 3 варианта.")
+            if reply:
+                options = reply.split("\n")
+                options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5][:3]
+                context.user_data["last_options"] = options
+                keyboard = [
+                    [
+                        InlineKeyboardButton("📝 Вариант 1", callback_data=f"choose_0"),
+                        InlineKeyboardButton("📝 Вариант 2", callback_data=f"choose_1"),
+                        InlineKeyboardButton("📝 Вариант 3", callback_data=f"choose_2")
+                    ],
+                    [
+                        InlineKeyboardButton("🔄 Ещё вариант", callback_data="action_more"),
+                        InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"🎯 Новые варианты:\n\n"
+                    f"1️⃣ {options[0]}\n"
+                    f"2️⃣ {options[1]}\n"
+                    f"3️⃣ {options[2]}\n\n"
+                    f"Выберите вариант:",
+                    reply_markup=reply_markup
+                )
+        return
+
+    # ===== СМЕНИТЬ ЦЕЛЬ =====
+    if data == "action_change_target":
+        await query.edit_message_text(
+            "📝 Введите имя цели вручную:\n"
+            "Напишите: /target <имя>"
+        )
+        return
+
+    # ===== РЕЖИМ =====
+    if data == "action_mode":
+        await query.edit_message_text(
+            "🎭 Выберите режим троллинга:",
+            reply_markup=get_mode_keyboard()
+        )
+        return
+
+    # ===== ВЫБОР РЕЖИМА =====
+    if data.startswith("mode_"):
+        mode = data.replace("mode_", "")
+        if user_id in session_data:
+            session_data[user_id]["mode"] = mode
+        mode_names = {
+            "logic": "Логик",
+            "mirror": "Зеркало",
+            "sarcasm": "Сарказм",
+            "provocator": "Провокатор",
+            "psychologist": "Психолог",
+            "chaos": "Хаос",
+            "statistic": "Статистик"
+        }
+        mode_descriptions = {
+            "logic": "Разбираю аргументы по косточкам, уничтожаю логикой.",
+            "mirror": "Копирую стиль противника, переворачиваю смысл.",
+            "sarcasm": "Уничтожаю через иронию и сарказм.",
+            "provocator": "Провоцирую на эмоции, чтобы он ошибся.",
+            "psychologist": "Анализирую поведение с юмором и колкостями.",
+            "chaos": "Абсурдные, но логически связанные ответы.",
+            "statistic": "Показываю статистику по оппоненту."
+        }
+        await query.edit_message_text(
+            f"✅ Режим **{mode_names.get(mode, mode)}** выбран.\n"
+            f"Описание: {mode_descriptions.get(mode, '')}\n\n"
+            f"Продолжайте пересылать сообщения."
+        )
+        return
+
+    # ===== ГРАДУС =====
+    if data == "action_degree":
+        # Анализируем последнее сообщение из сессии
+        if user_id in session_data and session_data[user_id]["history"]:
+            last_msg = session_data[user_id]["history"][-1]["text"]
+            degree = calculate_degree(last_msg)
+            await query.edit_message_text(
+                f"📊 Текущий градус: {degree}/10\n"
+                f"{'🟢 Спокойно' if degree < 4 else '🟡 Напряжённо' if degree < 7 else '🔴 Взрыв!'}"
+            )
+        else:
+            await query.edit_message_text("📊 Нет данных для анализа градуса.")
+        return
+
+    # ===== ЭКСПОРТ =====
+    if data == "action_export":
+        if user_id in session_data:
+            session = session_data[user_id]
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["Time", "Role", "Message"])
+            for entry in session.get("history", []):
+                writer.writerow([entry.get("timestamp", ""), entry.get("role", ""), entry.get("text", "")])
+            await query.edit_message_text("📤 Экспортирую диалог...")
+            await update.effective_message.reply_document(
+                document=io.BytesIO(output.getvalue().encode()),
+                filename=f"dialog_{session.get('target_name', 'unknown')}.csv",
+                caption="📊 История диалога"
+            )
+        else:
+            await query.edit_message_text("ℹ️ Нет активной сессии для экспорта.")
+        return
+
+    # ===== ЗАВЕРШИТЬ СЕССИЮ =====
+    if data == "action_stop":
+        await stop_session(update, context)
+        return
+
+    # ===== ПОМОЩЬ =====
+    if data == "action_help":
+        await query.edit_message_text(
+            "👋 Я — бот-ассистент по троллингу.\n\n"
+            "📌 Как я работаю:\n"
+            "1. Перешлите мне сообщение оппонента.\n"
+            "2. Я определю цель или попрошу уточнить.\n"
+            "3. Я анализирую каждое сообщение и предлагаю 3 варианта ответа.\n"
+            "4. Вы выбираете вариант или генерируете новый.\n\n"
+            "🎭 Режимы:\n"
+            "• Логик — разбор аргументов\n"
+            "• Зеркало — переворот смысла\n"
+            "• Сарказм — ирония\n"
+            "• Провокатор — вызов эмоций\n"
+            "• Психолог — анализ с юмором\n"
+            "• Хаос — абсурдные ответы\n"
+            "• Статистик — статистика по оппоненту\n\n"
+            "📊 Градус — оценка напряжённости.\n"
+            "📤 Экспорт — выгрузка диалога в CSV.\n"
+            "⏹ Завершить сессию — остановить анализ."
+        )
+        return
+
+    # ===== НАЗАД =====
+    if data == "action_back":
+        await query.edit_message_text(
+            "🔙 Возврат в главное меню.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id in session_data:
+        del session_data[user_id]
     await update.message.reply_text(
-        "👋 Я — бот для контр-атак в игровых чатах.\n\n"
-        "Выберите действие:",
-        reply_markup=reply_markup
+        "⏹ Сессия завершена.\n"
+        "Данные сохранены в историю диалогов.",
+        reply_markup=get_main_keyboard()
     )
 
-async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user_chat_collection[user_id] = []
-    await update.message.reply_text("📝 Режим сбора переписки включён. Отправляйте сообщения по одному. Когда закончите — напишите /done.")
-
-async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in user_chat_collection or not user_chat_collection[user_id]:
-        await update.message.reply_text("❌ Нет активного сбора переписки. Напишите /chat чтобы начать.")
-        return
-    full_text = "\n".join(user_chat_collection[user_id])
-    del user_chat_collection[user_id]
-    await process_text(update, context, full_text, None)
-
-async def stats_alias_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT player_id, alias FROM aliases")
-    rows = c.fetchall()
-    conn.close()
-    if not rows:
-        await update.message.reply_text("ℹ️ Нет сохранённых имён.")
-        return
-    text = "📋 Сохранённые имена:\n" + "\n".join([f"- {alias} (ID: {pid})" for pid, alias in rows])
-    await update.message.reply_text(text)
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Укажите ID или имя: /stats <ID_игрока> или /stats <имя>")
-        return
-    query = context.args[0]
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT player_id FROM aliases WHERE alias=?", (query,))
-    row = c.fetchone()
-    if row:
-        agg_id = row[0]
-    else:
-        agg_id = query
-    c.execute("SELECT history, weak_points, style_used, success_count, total_attacks FROM aggressors WHERE id=?", (agg_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        await update.message.reply_text(f"ℹ️ Нет данных об игроке {query}.")
-        return
-    history, weak, style, success, total = row
-    history_list = json.loads(history) if history else []
-    last_attacks = "\n".join([f"- {h['attack']} → {h['reply']}" for h in history_list[-3:]])
-    text = (
-        f"📊 Статистика для {query}:\n"
-        f"Всего атак: {total}\n"
-        f"Слабые места: {weak}\n"
-        f"Стиль: {style}\n"
-        f"Успешных ударов: {success}\n"
-        f"Последние 3 атаки/ответа:\n{last_attacks if last_attacks else 'нет'}"
+# ===== ОБРАБОТЧИК КОМАНД =====
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Я — бот-ассистент по троллингу.\n\n"
+        "📌 Как я работаю:\n"
+        "1. Перешлите мне сообщение оппонента.\n"
+        "2. Я определю цель или попрошу уточнить.\n"
+        "3. Я анализирую каждое сообщение и предлагаю 3 варианта ответа.\n"
+        "4. Вы выбираете вариант или генерируете новый.\n\n"
+        "🎭 Режимы: Логик, Зеркало, Сарказм, Провокатор, Психолог, Хаос, Статистик.\n"
+        "📊 Градус — оценка напряжённости.\n"
+        "📤 Экспорт — выгрузка диалога в CSV.\n"
+        "⏹ Завершить сессию — остановить анализ.\n\n"
+        "Нажмите кнопку, чтобы начать:",
+        reply_markup=get_main_keyboard()
     )
-    await update.message.reply_text(text)
 
-async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Укажите ID: /reset <ID_игрока>")
-        return
-    agg_id = context.args[0]
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM aggressors WHERE id=?", (agg_id,))
-    c.execute("DELETE FROM aliases WHERE player_id=?", (agg_id,))
-    c.execute("DELETE FROM dialog_history WHERE aggressor_id=?", (agg_id,))
-    conn.commit()
-    conn.close()
-    keys_to_del = [k for k in CACHE.keys() if k.endswith(f"_{agg_id}")]
-    for k in keys_to_del:
-        del CACHE[k]
-    save_cache()
-    await update.message.reply_text(f"✅ Память для игрока {agg_id} сброшена.")
-
-async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("DELETE FROM aggressors")
-    c.execute("DELETE FROM aliases")
-    c.execute("DELETE FROM dialog_history")
-    conn.commit()
-    conn.close()
-    CACHE.clear()
-    save_cache()
-    await update.message.reply_text("🗑 Вся память бота очищена.")
-
-# ===== ОБРАБОТЧИК ДЕЙСТВИЙ КНОПОК =====
-async def handle_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    action = query.data
-
-    if action == "action_chat":
-        user_chat_collection[user_id] = []
-        await query.edit_message_text("📝 Режим сбора переписки включён. Отправляйте сообщения по одному. Когда закончите — напишите /done.")
-    elif action == "action_auto":
-        context.user_data["auto_mode"] = True
-        await query.edit_message_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
-    elif action == "action_reset_all":
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("DELETE FROM aggressors")
-        c.execute("DELETE FROM aliases")
-        c.execute("DELETE FROM dialog_history")
-        conn.commit()
-        conn.close()
-        CACHE.clear()
-        save_cache()
-        await query.edit_message_text("🗑 Вся память бота очищена.")
-    elif action == "action_stats":
-        await query.edit_message_text("📊 Чтобы посмотреть статистику, введите: /stats <ID или имя>")
-    elif action == "action_export":
-        await export_stats(update, context)
-    elif action == "action_help":
-        await query.edit_message_text(
-            "👋 Я — бот для контр-атак.\n\n"
-            "Команды:\n"
-            "/chat — начать сбор переписки\n"
-            "/auto — включить авторежим\n"
-            "/test — тестовый режим (показать, что бы я ответил)\n"
-            "/stats <ID или имя> — статистика\n"
-            "/reset <ID> — сбросить игрока\n"
-            "/reset_all — стереть всё\n"
-            "/export_stats — экспорт статистики в CSV"
+    if context.args:
+        target_name = " ".join(context.args)
+        session_data[user_id] = {
+            "target_id": target_name,
+            "target_name": target_name,
+            "history": [],
+            "mode": "логик",
+            "created_at": datetime.now()
+        }
+        await update.message.reply_text(
+            f"🎯 Цель установлена: {target_name}\n\n"
+            "Теперь пересылайте мне сообщения оппонента, и я буду анализировать их.",
+            reply_markup=get_main_keyboard()
         )
+    else:
+        await update.message.reply_text("❌ Укажите имя: /target <имя>")
+
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await stop_session(update, context)
 
 # ===== ЗАПУСК =====
 def main():
@@ -753,20 +788,14 @@ def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("chat", chat_command))
-    app.add_handler(CommandHandler("done", done_command))
-    app.add_handler(CommandHandler("reset", reset_command))
-    app.add_handler(CommandHandler("reset_all", reset_all_command))
-    app.add_handler(CommandHandler("stats", stats_command))
-    app.add_handler(CommandHandler("stats_aliases", stats_alias_command))
-    app.add_handler(CommandHandler("export_stats", export_stats))
-    app.add_handler(CommandHandler("test", lambda u, c: u.message.reply_text("🧪 Используйте /test <сообщение> для теста")))
+    app.add_handler(CommandHandler("target", target_command))
+    app.add_handler(CommandHandler("stop", stop_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_)"))
-    app.add_handler(CallbackQueryHandler(handle_action_callback, pattern=r"^action_"))
+    app.add_handler(MessageHandler(filters.VOICE, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|action_)"))
 
-    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter)...")
+    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter + Groq Whisper)...")
     app.run_polling()
 
 if __name__ == "__main__":
