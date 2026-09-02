@@ -6,7 +6,6 @@ import hashlib
 import pickle
 import requests
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, Updater
 
 # ===== КОНФИГУРАЦИЯ (из переменных окружения Railway) =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -242,30 +241,12 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== ЗАПУСК (ИСПРАВЛЕННАЯ ВЕРСИЯ) =====
 def main():
     init_db()
-    
-    # Создаём Application без встроенного Updater
-    application = (
-        Application.builder()
-        .token(TELEGRAM_TOKEN)
-        .build()
-    )
-
-    # Добавляем обработчики команд
-    application.add_handler(CommandHandler("answer", answer_command))
-    application.add_handler(CommandHandler("reset", reset_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-
-    # Явно создаём Updater и запускаем вебхук
-    updater = Updater(bot=application.bot, update_queue=application.update_queue)
-    updater.start_webhook(
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("answer", answer_command))
+    app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.run_webhook(
         listen="0.0.0.0",
         port=int(os.getenv("PORT", 8080)),
-        url_path="webhook",
         webhook_url=WEBHOOK_URL + "/webhook"
     )
-    
-    # Ожидаем завершения
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
