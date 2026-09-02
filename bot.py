@@ -549,6 +549,19 @@ async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_cache()
     await update.message.reply_text("🗑 Вся память бота очищена.")
 
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Завершает сбор переписки и анализирует её"""
+    user_id = update.effective_user.id
+
+    if user_id not in user_chat_collection or not user_chat_collection[user_id]:
+        await update.message.reply_text("❌ Нет активного сбора переписки. Напишите /chat чтобы начать.")
+        return
+
+    full_text = "\n".join(user_chat_collection[user_id])
+    del user_chat_collection[user_id]
+
+    await process_text(update, context, full_text)
+    
 # ===== ОБРАБОТЧИК ДЕЙСТВИЙ КНОПОК =====
 async def handle_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -592,6 +605,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("chat", chat_command))
+    app.add_handler(CommandHandler("done", done_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("reset_all", reset_all_command))
     app.add_handler(CommandHandler("stats", stats_command))
