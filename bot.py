@@ -4,22 +4,21 @@ import json
 import sqlite3
 import hashlib
 import pickle
+import re
+import time
 import requests
-import time  # <-- ДОБАВЛЕНО для задержки
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 
-# ===== КОНФИГУРАЦИЯ (из переменных окружения Railway) =====
+# ===== КОНФИГУРАЦИЯ =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
 HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
-# WEBHOOK_URL больше не нужна, оставляем для совместимости
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "https://example.com")
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
 
-# ===== БАЗА ДАННЫХ (SQLite) =====
+# ===== БАЗА ДАННЫХ =====
 DB_PATH = "memory.db"
 def init_db():
     conn = sqlite3.connect(DB_PATH)
@@ -33,10 +32,17 @@ def init_db():
             success_count INTEGER DEFAULT 0
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS aliases (
+            player_id TEXT,
+            alias TEXT,
+            UNIQUE(player_id, alias)
+        )
+    """)
     conn.commit()
     conn.close()
 
-# ===== КЭШ (pickle) =====
+# ===== КЭШ =====
 CACHE_PATH = "cache.pkl"
 try:
     with open(CACHE_PATH, "rb") as f:
@@ -52,8 +58,10 @@ def get_cache_key(attack_text, agg_id):
     raw = f"{attack_text}_{agg_id}"
     return hashlib.md5(raw.encode()).hexdigest()
 
-# ===== ВЫЗОВ HUGGINGFACE (бесплатный API) =====
+# ===== ВЫЗОВ HF =====
 def call_hf(prompt):
+    if not HF_TOKEN:
+        return None
     url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
     payload = {
@@ -65,22 +73,18 @@ def call_hf(prompt):
         }
     }
     try:
-        # ===== ПУНКТ 3: ЗАДЕРЖКА МЕЖДУ ЗАПРОСАМИ =====
-        time.sleep(1)  # Чтобы не превышать лимит HuggingFace (30 запросов в минуту)
+        time.sleep(1)
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and "generated_text" in data[0]:
                 full = data[0]["generated_text"]
                 return full[len(prompt):].strip()
-            else:
-                return None
-        else:
-            return None
+        return None
     except:
         return None
 
-# ===== ЗАПАСНЫЕ ФРАЗЫ (если HF не отвечает) =====
+# ===== ЗАПАСНЫЕ ФРАЗЫ =====
 FALLBACKS = [
     "Твоя логика хромает на обе ноги. Попробуй ещё раз, но с умом.",
     "Оскорбление уровня 'мама' — классика для тех, у кого фантазия кончилась в 5 лет.",
@@ -90,20 +94,21 @@ FALLBACKS = [
     "Ой, смотри, кто заговорил про интеллект... Тишина в эфире.",
     "Продолжай — я собираю статистику твоих поражений.",
     "Даже бот понимает, что ты не прав. А ты — нет.",
+    "Твои слова — как твой KDA: низкие и бесполезные.",
+    "Ты бы лучше в игре что-то сделал, чем тут слова тратил.",
+    "Кто-то забыл выключить CapsLock и заодно мозг.",
 ]
 
 def get_fallback(attack_text):
     idx = hashlib.md5(attack_text.encode()).hexdigest()
     return FALLBACKS[int(idx, 16) % len(FALLBACKS)]
 
-# ===== ГЛАВНАЯ ЛОГИКА ГЕНЕРАЦИИ =====
+# ===== ЛОГИКА ГЕНЕРАЦИИ =====
 def generate_reply(attack_text: str, agg_id: str) -> str:
-    # 1. Кэш
     key = get_cache_key(attack_text, agg_id)
     if key in CACHE:
         return CACHE[key]
 
-    # 2. Загружаем историю агрессора
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT history, weak_points, style_used FROM aggressors WHERE id=?", (agg_id,))
@@ -116,7 +121,6 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
         weak = row[1] if row[1] else "неизвестно"
         style = row[2] if row[2] else "auto"
 
-    # 3. Определяем тип атаки и слабость (упрощённо)
     attack_lower = attack_text.lower()
     if "мам" in attack_lower or "мать" in attack_lower:
         target = "семья"
@@ -134,8 +138,7 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
     elif target not in weak:
         weak += f",{target}"
 
-    # 4. Выбор стиля (автоматически или из истории)
-    mat_count = sum(1 for w in attack_text.split() if w.lower() in ["мам", "дурак", "лох", "идиот", "бал", "гандон"])
+    mat_count = sum(1 for w in attack_text.split() if w.lower() in ["мам", "дурак", "лох", "идиот", "тупой", "гандон"])
     if style == "auto":
         if mat_count >= 2:
             style = "зеркало+язвительный"
@@ -144,7 +147,6 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
         else:
             style = "гибрид"
 
-    # 5. Формируем промпт
     prompt = (
         f"Ты — бот для контр-атак в игровом чате. Противник написал: \"{attack_text}\". "
         f"Его слабые места: {weak}. Твой стиль: {style}. "
@@ -153,21 +155,14 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
         f"Ответ:"
     )
 
-    # ===== ПУНКТ 4: ЛОГИРОВАНИЕ ВЫЗОВА HF =====
-    print("Вызов HF...")
     reply = call_hf(prompt)
-    print("Ответ HF:", reply)  # Будет None, если HF не отвечает
-
     if not reply:
         reply = get_fallback(attack_text)
-        print("Использована запасная фраза:", reply)
 
-    # 7. Обрезаем до 30 слов (приблизительно)
     words = reply.split()
     if len(words) > 30:
         reply = " ".join(words[:30]) + "..."
 
-    # 8. Сохраняем историю
     history.append({"attack": attack_text, "reply": reply})
     if len(history) > 5:
         history = history[-5:]
@@ -178,31 +173,168 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
     conn.commit()
     conn.close()
 
-    # 9. Пишем в кэш
     CACHE[key] = reply
     save_cache()
     return reply
 
-# ===== TELEGRAM ОБРАБОТЧИКИ =====
-async def answer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработка команды /answer <ID> <текст атаки>"""
-    if not context.args or len(context.args) < 2:
-        await update.message.reply_text(
-            "❌ Формат: /answer <ID_игрока> <текст атаки>\n"
-            "Пример: /answer 12345 Я твою маму бал"
-        )
-        return
-    agg_id = context.args[0]
-    attack_text = " ".join(context.args[1:])
-    if len(attack_text) == 0:
-        await update.message.reply_text("❌ Текст атаки не может быть пустым.")
+# ===== ИЗВЛЕЧЕНИЕ ИМЁН ИЗ ТЕКСТА =====
+def extract_aliases(text):
+    """Ищет в тексте фразы 'я — X', 'меня зовут X', 'это X' и т.п."""
+    patterns = [
+        r'я\s+[\-–]\s*(\w+)',
+        r'меня\s+зовут\s+(\w+)',
+        r'это\s+(\w+)',
+        r'я\s+(\w+)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return None
+
+def find_mentioned_player(text):
+    """Ищет в тексте упоминание имени (алиаса) из базы."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT player_id, alias FROM aliases")
+    rows = c.fetchall()
+    conn.close()
+    for player_id, alias in rows:
+        if alias.lower() in text.lower():
+            return player_id, alias
+    return None, None
+
+# ===== ХРАНЕНИЕ СОСТОЯНИЙ (FINAL STATE MACHINE) =====
+user_sessions = {}  # user_id -> { "step": "waiting_confirmation", "candidates": [...], "original_text": "..." }
+
+# ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Главный обработчик: анализирует текст и уточняет цель"""
+    user_id = update.effective_user.id
+    text = update.message.text
+
+    if not text:
         return
 
-    reply = generate_reply(attack_text, agg_id)
-    await update.message.reply_text(reply)
+    # === 1. ПРОВЕРКА: БОТ ЖДЁТ ПОДТВЕРЖДЕНИЯ ===
+    if user_id in user_sessions and user_sessions[user_id].get("step") == "waiting_confirmation":
+        # Пользователь отвечает на уточнение
+        if text.lower() in ["да", "yes", "+", "конечно", "ага"]:
+            # Подтверждаем цель
+            target = user_sessions[user_id].get("candidates", [None])[0]
+            if target:
+                # Генерируем ответ
+                original_text = user_sessions[user_id].get("original_text", "")
+                reply = generate_reply(original_text, target)
+                await update.message.reply_text(f"🎯 Цель: {target}\n\n{reply}")
+            else:
+                await update.message.reply_text("❌ Не удалось определить цель. Отправьте переписку заново.")
+            del user_sessions[user_id]
+            return
+
+        elif text.lower().startswith("нет"):
+            # Пользователь говорит, что цель не та
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                new_target = parts[1].strip()
+                if new_target:
+                    # Сохраняем новый алиас
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("INSERT OR IGNORE INTO aliases (player_id, alias) VALUES (?, ?)", (new_target, new_target))
+                    conn.commit()
+                    conn.close()
+                    # Генерируем ответ для новой цели
+                    original_text = user_sessions[user_id].get("original_text", "")
+                    reply = generate_reply(original_text, new_target)
+                    await update.message.reply_text(f"🎯 Цель изменена на: {new_target}\n\n{reply}")
+                else:
+                    await update.message.reply_text("❌ Укажите имя после 'нет'. Например: 'нет, это Баграт'")
+            else:
+                await update.message.reply_text("❌ Укажите имя после 'нет'. Например: 'нет, это Баграт'")
+            del user_sessions[user_id]
+            return
+
+    # === 2. ОБЫЧНЫЙ АНАЛИЗ: ИЩЕМ ЦЕЛЬ ===
+    # Проверяем, есть ли в тексте фраза "я — X" (самоидентификация)
+    alias = extract_aliases(text)
+    if alias:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO aliases (player_id, alias) VALUES (?, ?)", (str(update.effective_user.id), alias))
+        conn.commit()
+        conn.close()
+        await update.message.reply_text(f"👤 Запомнил: {alias} (это вы)")
+
+    # Проверяем, есть ли упоминание кого-то из базы
+    mentioned_id, mentioned_alias = find_mentioned_player(text)
+    if mentioned_id:
+        # Нашли цель
+        reply = generate_reply(text, mentioned_id)
+        await update.message.reply_text(f"🎯 Цель: {mentioned_alias}\n\n{reply}")
+        return
+
+    # === 3. НЕ НАШЛИ ЦЕЛЬ — УТОЧНЯЕМ ===
+    # Ищем все возможные имена в тексте (по шаблонам)
+    potential_names = re.findall(r'\b([А-ЯЁ][а-яё]+)\b', text)
+    if potential_names:
+        # Берём первое имя как кандидата
+        candidate = potential_names[0]
+        # Сохраняем состояние
+        user_sessions[user_id] = {
+            "step": "waiting_confirmation",
+            "candidates": [candidate],
+            "original_text": text
+        }
+        keyboard = [
+            [
+                InlineKeyboardButton("✅ Да", callback_data=f"confirm_{candidate}"),
+                InlineKeyboardButton("❌ Нет", callback_data=f"deny_{candidate}")
+            ]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.message.reply_text(
+            f"🤔 Я нашёл возможную цель: **{candidate}**.\n"
+            f"Это правильный игрок? (Нажмите кнопку или напишите 'да' / 'нет, это <имя>')",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text("❌ Не удалось определить цель в переписке. Укажите имя явно (например, 'я — Баграт' или 'Баграт, ты слабый').")
+
+# ===== ОБРАБОТЧИК КНОПОК =====
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    data = query.data
+
+    if data.startswith("confirm_"):
+        candidate = data.replace("confirm_", "")
+        if user_id in user_sessions:
+            original_text = user_sessions[user_id].get("original_text", "")
+            reply = generate_reply(original_text, candidate)
+            await query.edit_message_text(f"🎯 Цель подтверждена: {candidate}\n\n{reply}")
+            del user_sessions[user_id]
+    elif data.startswith("deny_"):
+        candidate = data.replace("deny_", "")
+        await query.edit_message_text(
+            f"❌ Отмена. Укажите имя вручную: напишите 'нет, это <имя>'"
+        )
+        # Не удаляем сессию — ждём ручного ввода
+
+# ===== КОМАНДЫ =====
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Я — бот для контр-атак в игровых чатах.\n\n"
+        "Просто отправь мне переписку (текст), и я:\n"
+        "1. Определю цель (игрока, которого нужно 'чморить').\n"
+        "2. Уточню, правильно ли я определил.\n"
+        "3. Сгенерирую ответ, который уничтожит его же логикой.\n\n"
+        "Пример:\n"
+        "«Баграт сказал мне, что я нуб, а я ему ответил, что он сам лох»"
+    )
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сброс памяти для конкретного ID: /reset <ID>"""
     if not context.args:
         await update.message.reply_text("❌ Укажите ID: /reset <ID_игрока>")
         return
@@ -210,6 +342,7 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM aggressors WHERE id=?", (agg_id,))
+    c.execute("DELETE FROM aliases WHERE player_id=?", (agg_id,))
     conn.commit()
     conn.close()
     keys_to_del = [k for k in CACHE.keys() if k.endswith(f"_{agg_id}")]
@@ -219,7 +352,6 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Память для игрока {agg_id} сброшена.")
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показать статистику по ID: /stats <ID>"""
     if not context.args:
         await update.message.reply_text("❌ Укажите ID: /stats <ID_игрока>")
         return
@@ -248,12 +380,15 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("answer", answer_command))
+
+    app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("stats", stats_command))
 
-    # Используем polling (работает без вебхука)
-    print("Бот запущен в режиме polling. Ожидание команд...")
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    print("Бот запущен с интерактивным уточнением цели...")
     app.run_polling()
 
 if __name__ == "__main__":
