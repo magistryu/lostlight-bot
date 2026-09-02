@@ -102,11 +102,9 @@ def queue_request(prompt):
     """Добавляет запрос в очередь и обрабатывает её с задержкой"""
     global last_request_time
     request_queue.append(prompt)
-    # Если очередь слишком большая — сообщаем об этом
     if len(request_queue) > 50:
         return "⚠️ Слишком много запросов. Попробуйте позже."
 
-    # Если время с последнего запроса меньше 2 секунд — ждём
     current_time = time.time()
     if current_time - last_request_time < 2:
         time.sleep(2 - (current_time - last_request_time))
@@ -115,8 +113,63 @@ def queue_request(prompt):
     return None
 
 # ===== ВЫЗОВ HF (с несколькими моделями) =====
+def call_hf(prompt, model):
+    """Вызов конкретной модели HuggingFace"""
+    try:
+        url = f"https://api-inference.huggingface.co/models/{model}"
+        headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "max_new_tokens": 50,
+                "temperature": 0.85,
+                "do_sample": True
+            }
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and "generated_text" in data[0]:
+                full = data[0]["generated_text"]
+                return full[len(prompt):].strip()
+        else:
+            logger.warning(f"HF model {model} returned {resp.status_code}")
+            return None
+    except Exception as e:
+        logger.warning(f"HF model {model} failed: {e}")
+        return None
+
+def call_openrouter(prompt):
+    """Вызов OpenRouter с автоматическим выбором бесплатной модели"""
+    if not OPENROUTER_KEY:
+        return None
+    try:
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
+            "Content-Type": "application/json"
+        }
+        # Используем openrouter/free для автоматического выбора
+        payload = {
+            "model": "openrouter/free",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 50,
+            "temperature": 0.85
+        }
+        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            if "choices" in data and len(data["choices"]) > 0:
+                return data["choices"][0]["message"]["content"].strip()
+        else:
+            logger.warning(f"OpenRouter returned {resp.status_code}: {resp.text[:200]}")
+            return None
+    except Exception as e:
+        logger.warning(f"OpenRouter failed: {e}")
+        return None
+
 def call_hf_with_fallback(prompt):
-    """Пробует все модели из списка HF_MODELS, если не получается — пробует OpenRouter, потом Fallback"""
+    """Пробует HF → OpenRouter → Fallback"""
     
     # Проверяем очередь
     queue_status = queue_request(prompt)
@@ -125,55 +178,26 @@ def call_hf_with_fallback(prompt):
 
     # 1. Пробуем HF модели
     for model in HF_MODELS:
-        try:
-            url = f"https://api-inference.huggingface.co/models/{model}"
-            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-            payload = {
-                "inputs": prompt,
-                "parameters": {
-                    "max_new_tokens": 50,
-                    "temperature": 0.85,
-                    "do_sample": True
-                }
-            }
-            resp = requests.post(url, json=payload, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if isinstance(data, list) and "generated_text" in data[0]:
-                    full = data[0]["generated_text"]
-                    return full[len(prompt):].strip()
-            else:
-                logger.warning(f"HF model {model} returned {resp.status_code}")
-                continue
-        except Exception as e:
-            logger.warning(f"HF model {model} failed: {e}")
-            continue
+        logger.info(f"Пробуем HF модель: {model}")
+        reply = call_hf(prompt, model)
+        if reply:
+            logger.info(f"✅ Ответ от HF: {model}")
+            return reply
+        else:
+            logger.warning(f"❌ HF модель {model} не ответила")
 
-    # 2. Если HF не ответил — пробуем OpenRouter
+    # 2. Пробуем OpenRouter
     if OPENROUTER_KEY:
-        try:
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_KEY}",
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "model": "openrouter/free",
-                "messages": [{"role": "user", "content": prompt}],
-                "max_tokens": 50,
-                "temperature": 0.85
-            }
-            resp = requests.post(url, json=payload, headers=headers, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json()
-                if "choices" in data and len(data["choices"]) > 0:
-                    return data["choices"][0]["message"]["content"].strip()
-            else:
-                logger.warning(f"OpenRouter returned {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"OpenRouter failed: {e}")
+        logger.info("Пробуем OpenRouter...")
+        reply = call_openrouter(prompt)
+        if reply:
+            logger.info("✅ Ответ от OpenRouter")
+            return reply
+        else:
+            logger.warning("❌ OpenRouter не ответил")
 
     # 3. Если ничего не сработало — возвращаем None
+    logger.warning("Все модели не ответили. Используем Fallback.")
     return None
 
 # ===== ЗАПАСНЫЕ ФРАЗЫ =====
@@ -298,7 +322,7 @@ def find_mentioned_player(text):
 user_sessions = {}
 user_chat_collection = {}
 
-# ===== ОБРАБОТЧИК СООБЩЕНИЙ (ИСПРАВЛЕННЫЙ) =====
+# ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     message = update.message
@@ -306,14 +330,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not message:
         return
 
-    # === ОБРАБОТКА ПЕРЕСЛАННЫХ СООБЩЕНИЙ ===
     text = None
     if message.text:
         text = message.text
     elif message.forward_from or message.forward_from_chat:
-        # Если переслано — берём текст из оригинального сообщения
         if message.forward_from_message_id:
-            # Пытаемся получить текст из пересланного
             try:
                 forwarded_msg = await context.bot.forward_message(
                     chat_id=message.chat.id,
@@ -329,14 +350,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # === ОЧИСТКА СЕССИЙ (таймаут 10 минут) ===
     if user_id in user_sessions:
         if datetime.now() - user_sessions[user_id].get("created_at", datetime.now()) > timedelta(minutes=10):
             del user_sessions[user_id]
             await update.message.reply_text("⏰ Сессия устарела. Начните заново.")
             return
 
-    # === РЕЖИМ СБОРА ПЕРЕПИСКИ ===
     if user_id in user_chat_collection:
         if text.lower() == "/done":
             full_text = "\n".join(user_chat_collection[user_id])
@@ -348,18 +367,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"📝 Сообщение добавлено. Всего: {len(user_chat_collection[user_id])}. Напишите /done, когда закончите.")
             return
 
-    # === ОБРАБОТКА КОМАНДЫ /done (если не в режиме сбора) ===
     if text.lower() == "/done":
         await update.message.reply_text("❌ Вы не в режиме сбора переписки. Напишите /chat чтобы начать.")
         return
 
-    # === РЕЖИМ /auto (без уточнения) ===
     if text.lower().startswith("/auto"):
         context.user_data["auto_mode"] = True
         await update.message.reply_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
         return
 
-    # === ОБЫЧНЫЙ АНАЛИЗ ===
     await process_text(update, text)
 
 async def process_text(update: Update, text: str):
@@ -478,7 +494,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Укажите ID или имя: /stats <ID_игрока> или /stats <имя>")
         return
     query = context.args[0]
-        conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT player_id FROM aliases WHERE alias=?", (query,))
     row = c.fetchone()
@@ -522,7 +538,6 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Память для игрока {agg_id} сброшена.")
 
 async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Полная очистка всей памяти бота"""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("DELETE FROM aggressors")
@@ -574,7 +589,6 @@ def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("chat", chat_command))
     app.add_handler(CommandHandler("reset", reset_command))
@@ -582,12 +596,11 @@ def main():
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("stats_aliases", stats_alias_command))
 
-    # Обработчики сообщений и кнопок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_)"))
     app.add_handler(CallbackQueryHandler(handle_action_callback, pattern=r"^action_"))
 
-    logger.info("Бот запущен с полной функциональностью...")
+    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter)...")
     app.run_polling()
 
 if __name__ == "__main__":
