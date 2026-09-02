@@ -6,9 +6,22 @@ import hashlib
 import pickle
 import re
 import time
+import logging
 import requests
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
+
+# ===== ЛОГИРОВАНИЕ =====
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler("bot.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 # ===== КОНФИГУРАЦИЯ =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
@@ -39,8 +52,29 @@ def init_db():
             UNIQUE(player_id, alias)
         )
     """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT,
+            user_id TEXT,
+            action TEXT,
+            target TEXT,
+            reply TEXT
+        )
+    """)
     conn.commit()
     conn.close()
+
+def log_action(user_id, action, target=None, reply=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO logs (timestamp, user_id, action, target, reply) VALUES (?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(), str(user_id), action, str(target), str(reply))
+    )
+    conn.commit()
+    conn.close()
+    logger.info(f"LOG: {user_id} -> {action} -> {target}")
 
 # ===== КЭШ =====
 CACHE_PATH = "cache.pkl"
@@ -81,7 +115,8 @@ def call_hf(prompt):
                 full = data[0]["generated_text"]
                 return full[len(prompt):].strip()
         return None
-    except:
+    except Exception as e:
+        logger.error(f"HF error: {e}")
         return None
 
 # ===== ЗАПАСНЫЕ ФРАЗЫ =====
@@ -177,14 +212,13 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
     save_cache()
     return reply
 
-# ===== ИЗВЛЕЧЕНИЕ ИМЁН ИЗ ТЕКСТА =====
+# ===== ИЗВЛЕЧЕНИЕ ИМЁН =====
 def extract_aliases(text):
-    """Ищет в тексте фразы 'я — X', 'меня зовут X', 'это X' и т.п."""
     patterns = [
-        r'я\s+[\-–]\s*(\w+)',
-        r'меня\s+зовут\s+(\w+)',
-        r'это\s+(\w+)',
-        r'я\s+(\w+)',
+        r'я\s+[\-–]\s*([A-Za-zА-ЯЁа-яё0-9_\-]+)',
+        r'меня\s+зовут\s+([A-Za-zА-ЯЁа-яё0-9_\-]+)',
+        r'это\s+([A-Za-zА-ЯЁа-яё0-9_\-]+)',
+        r'я\s+([A-Za-zА-ЯЁа-яё0-9_\-]+)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
@@ -193,7 +227,6 @@ def extract_aliases(text):
     return None
 
 def find_mentioned_player(text):
-    """Ищет в тексте упоминание имени (алиаса) из базы."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT player_id, alias FROM aliases")
@@ -204,59 +237,60 @@ def find_mentioned_player(text):
             return player_id, alias
     return None, None
 
-# ===== ХРАНЕНИЕ СОСТОЯНИЙ (FINAL STATE MACHINE) =====
-user_sessions = {}  # user_id -> { "step": "waiting_confirmation", "candidates": [...], "original_text": "..." }
+# ===== ХРАНЕНИЕ СОСТОЯНИЙ =====
+user_sessions = {}
+user_chat_collection = {}
 
 # ===== ОБРАБОТЧИК СООБЩЕНИЙ =====
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Главный обработчик: анализирует текст и уточняет цель"""
     user_id = update.effective_user.id
     text = update.message.text
 
     if not text:
         return
 
-    # === 1. ПРОВЕРКА: БОТ ЖДЁТ ПОДТВЕРЖДЕНИЯ ===
-    if user_id in user_sessions and user_sessions[user_id].get("step") == "waiting_confirmation":
-        # Пользователь отвечает на уточнение
-        if text.lower() in ["да", "yes", "+", "конечно", "ага"]:
-            # Подтверждаем цель
-            target = user_sessions[user_id].get("candidates", [None])[0]
-            if target:
-                # Генерируем ответ
-                original_text = user_sessions[user_id].get("original_text", "")
-                reply = generate_reply(original_text, target)
-                await update.message.reply_text(f"🎯 Цель: {target}\n\n{reply}")
-            else:
-                await update.message.reply_text("❌ Не удалось определить цель. Отправьте переписку заново.")
+    # === ОЧИСТКА СЕССИЙ (таймаут 10 минут) ===
+    if user_id in user_sessions:
+        if datetime.now() - user_sessions[user_id].get("created_at", datetime.now()) > timedelta(minutes=10):
             del user_sessions[user_id]
+            await update.message.reply_text("⏰ Сессия устарела. Начните заново.")
             return
 
-        elif text.lower().startswith("нет"):
-            # Пользователь говорит, что цель не та
-            parts = text.split(maxsplit=1)
-            if len(parts) > 1:
-                new_target = parts[1].strip()
-                if new_target:
-                    # Сохраняем новый алиас
-                    conn = sqlite3.connect(DB_PATH)
-                    c = conn.cursor()
-                    c.execute("INSERT OR IGNORE INTO aliases (player_id, alias) VALUES (?, ?)", (new_target, new_target))
-                    conn.commit()
-                    conn.close()
-                    # Генерируем ответ для новой цели
-                    original_text = user_sessions[user_id].get("original_text", "")
-                    reply = generate_reply(original_text, new_target)
-                    await update.message.reply_text(f"🎯 Цель изменена на: {new_target}\n\n{reply}")
-                else:
-                    await update.message.reply_text("❌ Укажите имя после 'нет'. Например: 'нет, это Баграт'")
-            else:
-                await update.message.reply_text("❌ Укажите имя после 'нет'. Например: 'нет, это Баграт'")
-            del user_sessions[user_id]
+    # === РЕЖИМ СБОРА ПЕРЕПИСКИ ===
+    if user_id in user_chat_collection:
+        if text.lower() == "/done":
+            # Склеиваем все сообщения
+            full_text = "\n".join(user_chat_collection[user_id])
+            del user_chat_collection[user_id]
+            # Передаём в анализ
+            await process_text(update, full_text)
+            return
+        else:
+            # Добавляем сообщение в коллекцию
+            user_chat_collection[user_id].append(text)
+            await update.message.reply_text(f"📝 Сообщение добавлено. Всего: {len(user_chat_collection[user_id])}. Напишите /done, когда закончите.")
             return
 
-    # === 2. ОБЫЧНЫЙ АНАЛИЗ: ИЩЕМ ЦЕЛЬ ===
-    # Проверяем, есть ли в тексте фраза "я — X" (самоидентификация)
+    # === ОБРАБОТКА КОМАНДЫ /done (если не в режиме сбора) ===
+    if text.lower() == "/done":
+        await update.message.reply_text("❌ Вы не в режиме сбора переписки. Напишите /chat чтобы начать.")
+        return
+
+    # === РЕЖИМ /auto (без уточнения) ===
+    if text.lower().startswith("/auto"):
+        # Включаем авторежим
+        context.user_data["auto_mode"] = True
+        await update.message.reply_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
+        return
+
+    # === ОБЫЧНЫЙ АНАЛИЗ ===
+    await process_text(update, text)
+
+async def process_text(update: Update, text: str):
+    user_id = update.effective_user.id
+    auto_mode = update.effective_user.id in context.user_data and context.user_data.get("auto_mode", False)
+
+    # Проверяем, есть ли фраза "я — X"
     alias = extract_aliases(text)
     if alias:
         conn = sqlite3.connect(DB_PATH)
@@ -265,26 +299,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.commit()
         conn.close()
         await update.message.reply_text(f"👤 Запомнил: {alias} (это вы)")
+        log_action(user_id, "self_identify", alias)
 
     # Проверяем, есть ли упоминание кого-то из базы
     mentioned_id, mentioned_alias = find_mentioned_player(text)
     if mentioned_id:
-        # Нашли цель
         reply = generate_reply(text, mentioned_id)
         await update.message.reply_text(f"🎯 Цель: {mentioned_alias}\n\n{reply}")
+        log_action(user_id, "auto_reply", mentioned_alias, reply)
         return
 
-    # === 3. НЕ НАШЛИ ЦЕЛЬ — УТОЧНЯЕМ ===
-    # Ищем все возможные имена в тексте (по шаблонам)
-    potential_names = re.findall(r'\b([А-ЯЁ][а-яё]+)\b', text)
-    if potential_names:
-        # Берём первое имя как кандидата
+    # === НЕ НАШЛИ ЦЕЛЬ — УТОЧНЯЕМ ===
+    potential_names = re.findall(r'\b([A-Za-zА-ЯЁа-яё0-9_\-]+)\b', text)
+    if potential_names and not auto_mode:
         candidate = potential_names[0]
-        # Сохраняем состояние
         user_sessions[user_id] = {
             "step": "waiting_confirmation",
             "candidates": [candidate],
-            "original_text": text
+            "original_text": text,
+            "created_at": datetime.now()
         }
         keyboard = [
             [
@@ -298,8 +331,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Это правильный игрок? (Нажмите кнопку или напишите 'да' / 'нет, это <имя>')",
             reply_markup=reply_markup
         )
+        log_action(user_id, "ask_confirmation", candidate)
+    elif auto_mode and potential_names:
+        # В авторежиме сразу берём первое имя
+        candidate = potential_names[0]
+        reply = generate_reply(text, candidate)
+        await update.message.reply_text(f"🎯 Цель: {candidate}\n\n{reply}")
+        log_action(user_id, "auto_reply", candidate, reply)
     else:
-        await update.message.reply_text("❌ Не удалось определить цель в переписке. Укажите имя явно (например, 'я — Баграт' или 'Баграт, ты слабый').")
+        await update.message.reply_text("❌ Не удалось определить цель. Напишите /chat, чтобы отправить переписку частями, или укажите имя явно.")
 
 # ===== ОБРАБОТЧИК КНОПОК =====
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -314,25 +354,76 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             original_text = user_sessions[user_id].get("original_text", "")
             reply = generate_reply(original_text, candidate)
             await query.edit_message_text(f"🎯 Цель подтверждена: {candidate}\n\n{reply}")
+            log_action(user_id, "confirm_reply", candidate, reply)
             del user_sessions[user_id]
     elif data.startswith("deny_"):
         candidate = data.replace("deny_", "")
         await query.edit_message_text(
             f"❌ Отмена. Укажите имя вручную: напишите 'нет, это <имя>'"
         )
-        # Не удаляем сессию — ждём ручного ввода
 
 # ===== КОМАНДЫ =====
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — бот для контр-атак в игровых чатах.\n\n"
-        "Просто отправь мне переписку (текст), и я:\n"
-        "1. Определю цель (игрока, которого нужно 'чморить').\n"
-        "2. Уточню, правильно ли я определил.\n"
-        "3. Сгенерирую ответ, который уничтожит его же логикой.\n\n"
+        "Команды:\n"
+        "/chat — начать сбор переписки (отправляй сообщения, закончи /done)\n"
+        "/auto — включить авторежим (без уточнения)\n"
+        "/reset <ID> — сбросить память об игроке\n"
+        "/stats <ID или имя> — статистика по игроку\n"
+        "/stats_aliases — список всех сохранённых имён\n\n"
         "Пример:\n"
-        "«Баграт сказал мне, что я нуб, а я ему ответил, что он сам лох»"
+        "«Баграт сказал мне, что я нуб»"
     )
+
+async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_chat_collection[user_id] = []
+    await update.message.reply_text("📝 Режим сбора переписки включён. Отправляйте сообщения по одному. Когда закончите — напишите /done.")
+
+async def stats_alias_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT player_id, alias FROM aliases")
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await update.message.reply_text("ℹ️ Нет сохранённых имён.")
+        return
+    text = "📋 Сохранённые имена:\n" + "\n".join([f"- {alias} (ID: {pid})" for pid, alias in rows])
+    await update.message.reply_text(text)
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("❌ Укажите ID или имя: /stats <ID_игрока> или /stats <имя>")
+        return
+    query = context.args[0]
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    # Пытаемся найти по алиасу
+    c.execute("SELECT player_id FROM aliases WHERE alias=?", (query,))
+    row = c.fetchone()
+    if row:
+        agg_id = row[0]
+    else:
+        agg_id = query
+    c.execute("SELECT history, weak_points, style_used, success_count FROM aggressors WHERE id=?", (agg_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        await update.message.reply_text(f"ℹ️ Нет данных об игроке {query}.")
+        return
+    history, weak, style, success = row
+    history_list = json.loads(history) if history else []
+    last_attacks = "\n".join([f"- {h['attack']} → {h['reply']}" for h in history_list[-3:]])
+    text = (
+        f"📊 Статистика для {query}:\n"
+        f"Слабые места: {weak}\n"
+        f"Стиль: {style}\n"
+        f"Успешных ударов: {success}\n"
+        f"Последние 3 атаки/ответа:\n{last_attacks if last_attacks else 'нет'}"
+    )
+    await update.message.reply_text(text)
 
 async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -351,44 +442,22 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_cache()
     await update.message.reply_text(f"✅ Память для игрока {agg_id} сброшена.")
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("❌ Укажите ID: /stats <ID_игрока>")
-        return
-    agg_id = context.args[0]
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT history, weak_points, style_used, success_count FROM aggressors WHERE id=?", (agg_id,))
-    row = c.fetchone()
-    conn.close()
-    if not row:
-        await update.message.reply_text(f"ℹ️ Нет данных об игроке {agg_id}.")
-        return
-    history, weak, style, success = row
-    history_list = json.loads(history) if history else []
-    last_attacks = "\n".join([f"- {h['attack']} → {h['reply']}" for h in history_list[-3:]])
-    text = (
-        f"📊 Статистика для ID {agg_id}:\n"
-        f"Слабые места: {weak}\n"
-        f"Стиль: {style}\n"
-        f"Успешных ударов: {success}\n"
-        f"Последние 3 атаки/ответа:\n{last_attacks if last_attacks else 'нет'}"
-    )
-    await update.message.reply_text(text)
-
 # ===== ЗАПУСК =====
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("chat", chat_command))
     app.add_handler(CommandHandler("reset", reset_command))
     app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("stats_aliases", stats_alias_command))
+    app.add_handler(CommandHandler("auto", lambda u, c: u.message.reply_text("✅ Режим /auto включён.")))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback))
 
-    print("Бот запущен с интерактивным уточнением цели...")
+    logger.info("Бот запущен с полной функциональностью...")
     app.run_polling()
 
 if __name__ == "__main__":
