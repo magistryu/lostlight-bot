@@ -34,7 +34,6 @@ HF_TOKEN = os.getenv("HF_TOKEN")
 HF_MODELS = os.getenv("HF_MODELS", "google/flan-t5-small")
 HF_MODELS = [m.strip() for m in HF_MODELS.split(",") if m.strip()]
 OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", None)
-GROQ_API_KEY = os.getenv("GROQ_API_KEY", None)  # <-- НОВОЕ: для голосовых
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -264,36 +263,13 @@ def find_mentioned_player(text):
 def is_offensive(text):
     return any(word in text.lower() for word in OFFENSIVE_WORDS)
 
-# ===== РАСПОЗНАВАНИЕ ГОЛОСОВЫХ СООБЩЕНИЙ (через Groq Whisper API) =====
-async def transcribe_voice(file_path):
-    """Отправляет аудиофайл в Groq Whisper API и возвращает текст"""
-    if not GROQ_API_KEY:
-        logger.warning("GROQ_API_KEY не задан")
-        return None
-    try:
-        url = "https://api.groq.com/openai/v1/audio/transcriptions"
-        headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-        with open(file_path, "rb") as f:
-            files = {"file": f}
-            data = {"model": "whisper-large-v3", "language": "ru"}
-            resp = requests.post(url, headers=headers, files=files, data=data, timeout=30)
-            if resp.status_code == 200:
-                result = resp.json()
-                return result.get("text", "").strip()
-            else:
-                logger.warning(f"Groq returned {resp.status_code}: {resp.text}")
-                return None
-    except Exception as e:
-        logger.warning(f"Groq Whisper failed: {e}")
-        return None
-
 # ===== ХРАНЕНИЕ СОСТОЯНИЙ =====
 user_sessions = {}
 user_chat_collection = {}
 dialog_histories = {}
 banned_players = {}
 last_message_time = {}
-session_data = {}  # user_id -> {"target_id": ..., "target_name": ..., "history": [], "mode": "логик"}
+session_data = {}
 
 # ===== КНОПКИ ГЛАВНОГО МЕНЮ =====
 def get_main_keyboard():
@@ -351,27 +327,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(3 - (time.time() - last_time))
     last_message_time[user_id] = time.time()
 
-    # ===== ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ =====
-    if message.voice:
-        await update.message.reply_text("🎤 Распознаю голосовое сообщение...")
-        try:
-            file = await context.bot.get_file(message.voice.file_id)
-            file_path = f"voice_{user_id}_{int(time.time())}.ogg"
-            await file.download_to_drive(file_path)
-            text = await transcribe_voice(file_path)
-            os.remove(file_path)
-            if text:
-                await update.message.reply_text(f"📝 Распознано: \"{text}\"")
-                # Подставляем распознанный текст в обработку
-                message.text = text
-            else:
-                await update.message.reply_text("❌ Не удалось распознать голосовое сообщение.")
-                return
-        except Exception as e:
-            logger.error(f"Voice processing error: {e}")
-            await update.message.reply_text("❌ Ошибка при обработке голосового сообщения.")
-            return
-
     text = None
     if message.text:
         text = message.text
@@ -380,8 +335,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 forwarded_msg = await context.bot.forward_message(
                     chat_id=message.chat.id,
-                    from_chat_id=message.forward_from_chat.id if message.forward_from_chat else message.chat.id,
-                    message_id=message.forward_from_message_id
+
+                  message_id=message.forward_from_message_id
                 )
                 text = forwarded_msg.text
             except:
@@ -398,15 +353,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== СЕССИЯ: ПРОВЕРКА НА АКТИВНОСТЬ =====
     if user_id in session_data:
         session = session_data[user_id]
-        # Если цель не определена — пытаемся определить
         if not session.get("target_id"):
             await auto_detect_target(update, context, text)
             return
-        # Если цель определена — анализируем
         if text.lower().startswith("/stop"):
             await stop_session(update, context)
             return
-        # Проверка на оскорбления
         if is_offensive(text):
             degree = calculate_degree(text)
             if degree >= 5:
@@ -420,7 +372,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ===== НОВАЯ СЕССИЯ =====
-    # Проверяем, есть ли в тексте явное указание на цель (через команду или контекст)
     if text.lower().startswith("/target"):
         parts = text.split(maxsplit=1)
         if len(parts) > 1:
@@ -439,13 +390,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-    # Пытаемся автоматически определить цель
     await auto_detect_target(update, context, text)
 
 async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Автоматически определяет цель по первому сообщению"""
     user_id = update.effective_user.id
-    # Ищем имя в тексте
     potential_names = re.findall(r'\b([A-Za-zА-ЯЁа-яё0-9_\-]+)\b', text)
     candidates = [name for name in potential_names if name.lower() not in STOP_WORDS]
     if candidates:
@@ -472,7 +420,6 @@ async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
 
 async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    """Генерирует 3 варианта ответа"""
     user_id = update.effective_user.id
     session = session_data.get(user_id)
     if not session:
@@ -482,12 +429,10 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     target_name = session.get("target_name")
     mode = session.get("mode", "логик")
 
-    # Сохраняем в историю
     session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
     if len(session["history"]) > 20:
         session["history"] = session["history"][-20:]
 
-    # Генерируем ответы
     styles = {
         "логик": "логический анализ, разбор аргументов",
         "зеркало": "копирование стиля с переворотом смысла",
@@ -512,14 +457,12 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         await update.message.reply_text("⚠️ Не удалось сгенерировать ответ. Попробуйте позже.")
         return
 
-    # Разбиваем на варианты (если есть)
     options = reply.split("\n")
     options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
     if len(options) < 3:
         options = options + ["Вариант 1: " + reply, "Вариант 2: " + reply, "Вариант 3: " + reply]
     options = options[:3]
 
-    # Сохраняем последние варианты для кнопки "Ещё"
     context.user_data["last_options"] = options
     context.user_data["last_prompt"] = prompt
 
@@ -548,7 +491,6 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     )
 
 def calculate_degree(text):
-    """Оценивает градус напряжённости от 0 до 10"""
     score = 0
     for word in OFFENSIVE_WORDS:
         if word in text.lower():
@@ -571,23 +513,20 @@ def analyze_context(text):
         "is_long": length > 60
     }
 
-# ===== ОБРАБОТЧИК КНОПОК (CallbackQuery) =====
+# ===== ОБРАБОТЧИК КНОПОК =====
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = update.effective_user.id
     data = query.data
 
-    # ===== ВЫБОР ВАРИАНТА ОТВЕТА =====
     if data.startswith("choose_"):
         idx = int(data.replace("choose_", ""))
         options = context.user_data.get("last_options", [])
         if idx < len(options):
             await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
-            # Можно добавить кнопку "Отправить в чат" или "Копировать"
         return
 
-    # ===== ЕЩЁ ВАРИАНТ =====
     if data == "action_more":
         prompt = context.user_data.get("last_prompt", "")
         if prompt:
@@ -618,23 +557,14 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         return
 
-    # ===== СМЕНИТЬ ЦЕЛЬ =====
     if data == "action_change_target":
-        await query.edit_message_text(
-            "📝 Введите имя цели вручную:\n"
-            "Напишите: /target <имя>"
-        )
+        await query.edit_message_text("📝 Введите имя цели вручную:\nНапишите: /target <имя>")
         return
 
-    # ===== РЕЖИМ =====
     if data == "action_mode":
-        await query.edit_message_text(
-            "🎭 Выберите режим троллинга:",
-            reply_markup=get_mode_keyboard()
-        )
+        await query.edit_message_text("🎭 Выберите режим троллинга:", reply_markup=get_mode_keyboard())
         return
 
-    # ===== ВЫБОР РЕЖИМА =====
     if data.startswith("mode_"):
         mode = data.replace("mode_", "")
         if user_id in session_data:
@@ -664,9 +594,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== ГРАДУС =====
     if data == "action_degree":
-        # Анализируем последнее сообщение из сессии
         if user_id in session_data and session_data[user_id]["history"]:
             last_msg = session_data[user_id]["history"][-1]["text"]
             degree = calculate_degree(last_msg)
@@ -678,7 +606,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("📊 Нет данных для анализа градуса.")
         return
 
-    # ===== ЭКСПОРТ =====
     if data == "action_export":
         if user_id in session_data:
             session = session_data[user_id]
@@ -697,12 +624,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("ℹ️ Нет активной сессии для экспорта.")
         return
 
-    # ===== ЗАВЕРШИТЬ СЕССИЮ =====
     if data == "action_stop":
         await stop_session(update, context)
         return
 
-    # ===== ПОМОЩЬ =====
     if data == "action_help":
         await query.edit_message_text(
             "👋 Я — бот-ассистент по троллингу.\n\n"
@@ -725,12 +650,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== НАЗАД =====
     if data == "action_back":
-        await query.edit_message_text(
-            "🔙 Возврат в главное меню.",
-            reply_markup=get_main_keyboard()
-        )
+        await query.edit_message_text("🔙 Возврат в главное меню.", reply_markup=get_main_keyboard())
         return
 
 async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,12 +659,11 @@ async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user_id in session_data:
         del session_data[user_id]
     await update.message.reply_text(
-        "⏹ Сессия завершена.\n"
-        "Данные сохранены в историю диалогов.",
+        "⏹ Сессия завершена.\nДанные сохранены в историю диалогов.",
         reply_markup=get_main_keyboard()
     )
 
-# ===== ОБРАБОТЧИК КОМАНД =====
+# ===== КОМАНДЫ =====
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — бот-ассистент по троллингу.\n\n"
@@ -792,10 +712,9 @@ def main():
     app.add_handler(CommandHandler("stop", stop_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(filters.VOICE, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|action_)"))
 
-    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter + Groq Whisper)...")
+    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter)...")
     app.run_polling()
 
 if __name__ == "__main__":
