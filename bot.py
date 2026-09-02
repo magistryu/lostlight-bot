@@ -26,7 +26,9 @@ logger = logging.getLogger(__name__)
 # ===== КОНФИГУРАЦИЯ =====
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 HF_TOKEN = os.getenv("HF_TOKEN")
-HF_MODEL = os.getenv("HF_MODEL", "mistralai/Mistral-7B-Instruct-v0.3")
+HF_MODELS = os.getenv("HF_MODELS", "google/flan-t5-small")
+HF_MODELS = [m.strip() for m in HF_MODELS.split(",") if m.strip()]
+OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", None)
 
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
@@ -92,32 +94,87 @@ def get_cache_key(attack_text, agg_id):
     raw = f"{attack_text}_{agg_id}"
     return hashlib.md5(raw.encode()).hexdigest()
 
-# ===== ВЫЗОВ HF =====
-def call_hf(prompt):
-    if not HF_TOKEN:
-        return None
-    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "max_new_tokens": 50,
-            "temperature": 0.85,
-            "do_sample": True
-        }
-    }
-    try:
-        time.sleep(1)
-        resp = requests.post(url, json=payload, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            if isinstance(data, list) and "generated_text" in data[0]:
-                full = data[0]["generated_text"]
-                return full[len(prompt):].strip()
-        return None
-    except Exception as e:
-        logger.error(f"HF error: {e}")
-        return None
+# ===== ОЧЕРЕДЬ ЗАПРОСОВ =====
+request_queue = []
+last_request_time = 0
+
+def queue_request(prompt):
+    """Добавляет запрос в очередь и обрабатывает её с задержкой"""
+    global last_request_time
+    request_queue.append(prompt)
+    # Если очередь слишком большая — сообщаем об этом
+    if len(request_queue) > 50:
+        return "⚠️ Слишком много запросов. Попробуйте позже."
+
+    # Если время с последнего запроса меньше 2 секунд — ждём
+    current_time = time.time()
+    if current_time - last_request_time < 2:
+        time.sleep(2 - (current_time - last_request_time))
+
+    last_request_time = time.time()
+    return None
+
+# ===== ВЫЗОВ HF (с несколькими моделями) =====
+def call_hf_with_fallback(prompt):
+    """Пробует все модели из списка HF_MODELS, если не получается — пробует OpenRouter, потом Fallback"""
+    
+    # Проверяем очередь
+    queue_status = queue_request(prompt)
+    if queue_status:
+        return queue_status
+
+    # 1. Пробуем HF модели
+    for model in HF_MODELS:
+        try:
+            url = f"https://api-inference.huggingface.co/models/{model}"
+            headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+            payload = {
+                "inputs": prompt,
+                "parameters": {
+                    "max_new_tokens": 50,
+                    "temperature": 0.85,
+                    "do_sample": True
+                }
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if isinstance(data, list) and "generated_text" in data[0]:
+                    full = data[0]["generated_text"]
+                    return full[len(prompt):].strip()
+            else:
+                logger.warning(f"HF model {model} returned {resp.status_code}")
+                continue
+        except Exception as e:
+            logger.warning(f"HF model {model} failed: {e}")
+            continue
+
+    # 2. Если HF не ответил — пробуем OpenRouter
+    if OPENROUTER_KEY:
+        try:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_KEY}",
+                "Content-Type": "application/json"
+            }
+            payload = {
+                "model": "openrouter/free",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 50,
+                "temperature": 0.85
+            }
+            resp = requests.post(url, json=payload, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                if "choices" in data and len(data["choices"]) > 0:
+                    return data["choices"][0]["message"]["content"].strip()
+            else:
+                logger.warning(f"OpenRouter returned {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"OpenRouter failed: {e}")
+
+    # 3. Если ничего не сработало — возвращаем None
+    return None
 
 # ===== ЗАПАСНЫЕ ФРАЗЫ =====
 FALLBACKS = [
@@ -190,7 +247,7 @@ def generate_reply(attack_text: str, agg_id: str) -> str:
         f"Ответ:"
     )
 
-    reply = call_hf(prompt)
+    reply = call_hf_with_fallback(prompt)
     if not reply:
         reply = get_fallback(attack_text)
 
@@ -259,14 +316,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # === РЕЖИМ СБОРА ПЕРЕПИСКИ ===
     if user_id in user_chat_collection:
         if text.lower() == "/done":
-            # Склеиваем все сообщения
             full_text = "\n".join(user_chat_collection[user_id])
             del user_chat_collection[user_id]
-            # Передаём в анализ
             await process_text(update, full_text)
             return
         else:
-            # Добавляем сообщение в коллекцию
             user_chat_collection[user_id].append(text)
             await update.message.reply_text(f"📝 Сообщение добавлено. Всего: {len(user_chat_collection[user_id])}. Напишите /done, когда закончите.")
             return
@@ -278,7 +332,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # === РЕЖИМ /auto (без уточнения) ===
     if text.lower().startswith("/auto"):
-        # Включаем авторежим
         context.user_data["auto_mode"] = True
         await update.message.reply_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
         return
@@ -290,7 +343,6 @@ async def process_text(update: Update, text: str):
     user_id = update.effective_user.id
     auto_mode = update.effective_user.id in context.user_data and context.user_data.get("auto_mode", False)
 
-    # Проверяем, есть ли фраза "я — X"
     alias = extract_aliases(text)
     if alias:
         conn = sqlite3.connect(DB_PATH)
@@ -301,7 +353,6 @@ async def process_text(update: Update, text: str):
         await update.message.reply_text(f"👤 Запомнил: {alias} (это вы)")
         log_action(user_id, "self_identify", alias)
 
-    # Проверяем, есть ли упоминание кого-то из базы
     mentioned_id, mentioned_alias = find_mentioned_player(text)
     if mentioned_id:
         reply = generate_reply(text, mentioned_id)
@@ -309,7 +360,6 @@ async def process_text(update: Update, text: str):
         log_action(user_id, "auto_reply", mentioned_alias, reply)
         return
 
-    # === НЕ НАШЛИ ЦЕЛЬ — УТОЧНЯЕМ ===
     potential_names = re.findall(r'\b([A-Za-zА-ЯЁа-яё0-9_\-]+)\b', text)
     if potential_names and not auto_mode:
         candidate = potential_names[0]
@@ -333,7 +383,6 @@ async def process_text(update: Update, text: str):
         )
         log_action(user_id, "ask_confirmation", candidate)
     elif auto_mode and potential_names:
-        # В авторежиме сразу берём первое имя
         candidate = potential_names[0]
         reply = generate_reply(text, candidate)
         await update.message.reply_text(f"🎯 Цель: {candidate}\n\n{reply}")
@@ -364,16 +413,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== КОМАНДЫ =====
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("📝 Новая переписка", callback_data="action_chat"),
+            InlineKeyboardButton("⚡ Авторежим", callback_data="action_auto")
+        ],
+        [
+            InlineKeyboardButton("🗑 Стереть всё", callback_data="action_reset_all"),
+            InlineKeyboardButton("📊 Статистика", callback_data="action_stats")
+        ],
+        [
+            InlineKeyboardButton("❓ Помощь", callback_data="action_help")
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
         "👋 Я — бот для контр-атак в игровых чатах.\n\n"
-        "Команды:\n"
-        "/chat — начать сбор переписки (отправляй сообщения, закончи /done)\n"
-        "/auto — включить авторежим (без уточнения)\n"
-        "/reset <ID> — сбросить память об игроке\n"
-        "/stats <ID или имя> — статистика по игроку\n"
-        "/stats_aliases — список всех сохранённых имён\n\n"
-        "Пример:\n"
-        "«Баграт сказал мне, что я нуб»"
+        "Выберите действие:",
+        reply_markup=reply_markup
     )
 
 async def chat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,7 +457,6 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = context.args[0]
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Пытаемся найти по алиасу
     c.execute("SELECT player_id FROM aliases WHERE alias=?", (query,))
     row = c.fetchone()
     if row:
@@ -442,20 +498,71 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_cache()
     await update.message.reply_text(f"✅ Память для игрока {agg_id} сброшена.")
 
+async def reset_all_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полная очистка всей памяти бота"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM aggressors")
+    c.execute("DELETE FROM aliases")
+    conn.commit()
+    conn.close()
+    CACHE.clear()
+    save_cache()
+    await update.message.reply_text("🗑 Вся память бота очищена.")
+
+# ===== ОБРАБОТЧИК ДЕЙСТВИЙ КНОПОК =====
+async def handle_action_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    action = query.data
+
+    if action == "action_chat":
+        user_chat_collection[user_id] = []
+        await query.edit_message_text("📝 Режим сбора переписки включён. Отправляйте сообщения по одному. Когда закончите — напишите /done.")
+    elif action == "action_auto":
+        context.user_data["auto_mode"] = True
+        await query.edit_message_text("✅ Режим /auto включён. Теперь бот будет отвечать сразу без уточнения.")
+    elif action == "action_reset_all":
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("DELETE FROM aggressors")
+        c.execute("DELETE FROM aliases")
+        conn.commit()
+        conn.close()
+        CACHE.clear()
+        save_cache()
+        await query.edit_message_text("🗑 Вся память бота очищена.")
+    elif action == "action_stats":
+        await query.edit_message_text("📊 Чтобы посмотреть статистику, введите: /stats <ID или имя>")
+    elif action == "action_help":
+        await query.edit_message_text(
+            "👋 Я — бот для контр-атак.\n\n"
+            "Команды:\n"
+            "/chat — начать сбор переписки\n"
+            "/auto — включить авторежим\n"
+            "/stats <ID или имя> — статистика\n"
+            "/reset <ID> — сбросить игрока\n"
+            "/reset_all — стереть всё"
+        )
+
 # ===== ЗАПУСК =====
 def main():
     init_db()
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # Команды
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("chat", chat_command))
     app.add_handler(CommandHandler("reset", reset_command))
+    app.add_handler(CommandHandler("reset_all", reset_all_command))
     app.add_handler(CommandHandler("stats", stats_command))
     app.add_handler(CommandHandler("stats_aliases", stats_alias_command))
-    app.add_handler(CommandHandler("auto", lambda u, c: u.message.reply_text("✅ Режим /auto включён.")))
 
+    # Обработчики сообщений и кнопок
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_)"))
+    app.add_handler(CallbackQueryHandler(handle_action_callback, pattern=r"^action_"))
 
     logger.info("Бот запущен с полной функциональностью...")
     app.run_polling()
