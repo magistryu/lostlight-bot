@@ -617,22 +617,22 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ]
     strategy = random.choice(strategies)
 
-        if copy_mode.get(user_id, False):
-        await update.message.reply_text(
-            f"📋 {options[0]}",
-            reply_markup=get_main_keyboard()
-        )
-        return
+if copy_mode.get(user_id, False):
+    await update.message.reply_text(
+        f"📋 {options[0]}",
+        reply_markup=get_main_keyboard()
+    )
+    return
 
-    buttons = []
-    for i in range(count):
-        buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
-    keyboard = [buttons]
-    keyboard.append([
-        InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
-        InlineKeyboardButton("🔙 Назад", callback_data="action_back")
-    ])
-    reply_markup = InlineKeyboardMarkup(keyboard)
+buttons = []
+for i in range(count):
+    buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
+keyboard = [buttons]
+keyboard.append([
+    InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
+    InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+])
+reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(
         f"🎯 Цель: {target_name} | Режим: {mode}\n"
