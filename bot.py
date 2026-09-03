@@ -182,7 +182,7 @@ def analyze_tone(text):
     else:
         return "neutral"
 
-# ===== ВЫЗОВ HF =====
+# ===== ВЫЗОВ HF (С ЛОГИРОВАНИЕМ) =====
 def call_hf(prompt, model):
     try:
         url = f"https://api-inference.huggingface.co/models/{model}"
@@ -195,21 +195,29 @@ def call_hf(prompt, model):
                 "do_sample": True
             }
         }
+        logger.info(f"🔵 Отправка запроса в HF: {model}")
         resp = requests.post(url, json=payload, headers=headers, timeout=15)
+        logger.info(f"🔵 HF ответ: статус {resp.status_code}")
+        logger.info(f"🔵 HF тело: {resp.text[:500]}")
         if resp.status_code == 200:
             data = resp.json()
             if isinstance(data, list) and "generated_text" in data[0]:
                 full = data[0]["generated_text"]
                 return full[len(prompt):].strip()
+            else:
+                logger.warning(f"HF: неожиданный формат ответа: {data}")
+                return None
         else:
-            logger.warning(f"HF model {model} returned {resp.status_code}")
+            logger.warning(f"HF model {model} returned {resp.status_code}: {resp.text[:200]}")
             return None
     except Exception as e:
-        logger.warning(f"HF model {model} failed: {e}")
+        logger.error(f"HF model {model} failed: {e}")
         return None
 
+# ===== ВЫЗОВ OPENROUTER (С ЛОГИРОВАНИЕМ) =====
 def call_openrouter(prompt):
     if not OPENROUTER_KEY:
+        logger.warning("OPENROUTER_KEY не задан")
         return None
     try:
         url = "https://openrouter.ai/api/v1/chat/completions"
@@ -223,16 +231,22 @@ def call_openrouter(prompt):
             "max_tokens": 50,
             "temperature": 0.85
         }
+        logger.info("🔵 Отправка запроса в OpenRouter")
         resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        logger.info(f"🔵 OpenRouter ответ: статус {resp.status_code}")
+        logger.info(f"🔵 OpenRouter тело: {resp.text[:500]}")
         if resp.status_code == 200:
             data = resp.json()
             if "choices" in data and len(data["choices"]) > 0:
                 return data["choices"][0]["message"]["content"].strip()
+            else:
+                logger.warning(f"OpenRouter: неожиданный формат ответа: {data}")
+                return None
         else:
             logger.warning(f"OpenRouter returned {resp.status_code}: {resp.text[:200]}")
             return None
     except Exception as e:
-        logger.warning(f"OpenRouter failed: {e}")
+        logger.error(f"OpenRouter failed: {e}")
         return None
 
 def call_hf_with_fallback(prompt):
