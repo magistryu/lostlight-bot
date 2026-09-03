@@ -184,7 +184,6 @@ SARCASM_MARKERS = ["ну", "да", "конечно", "ага", "ясно", "по
 PASSIVE_MARKERS = ["извини", "прости", "наверное", "возможно", "кажется", "может быть", "наверно"]
 
 def analyze_tone(text):
-    """Определяет тон сообщения: агрессивный, саркастичный, пассивный или нейтральный"""
     lower = text.lower()
     aggression_score = sum(1 for word in AGGRESSION_MARKERS if word in lower)
     sarcasm_score = sum(1 for word in SARCASM_MARKERS if word in lower)
@@ -313,7 +312,10 @@ user_sessions = {}
 banned_players = {}
 last_message_time = {}
 session_data = {}
-message_queue = {}  # user_id -> [messages]
+message_queue = {}
+turbo_mode = {}  # user_id -> bool
+copy_mode = {}  # user_id -> bool
+count_mode = {}  # user_id -> int (1, 3, 5)
 
 # ===== КНОПКИ =====
 def get_main_keyboard():
@@ -325,6 +327,10 @@ def get_main_keyboard():
         [
             InlineKeyboardButton("📊 Тон", callback_data="action_tone"),
             InlineKeyboardButton("📤 Экспорт", callback_data="action_export")
+        ],
+        [
+            InlineKeyboardButton("📋 Копирование", callback_data="action_copy_mode"),
+            InlineKeyboardButton("⚡ Турбо", callback_data="action_turbo")
         ],
         [
             InlineKeyboardButton("⏹ Завершить сессию", callback_data="action_stop"),
@@ -340,7 +346,7 @@ def get_mode_keyboard():
             InlineKeyboardButton("🪞 Зеркало", callback_data="mode_mirror")
         ],
         [
-            InlineKeyboardButton("😏 Сарказм", callback_data="mode_sarcasm"),
+                        InlineKeyboardButton("😏 Сарказм", callback_data="mode_sarcasm"),
             InlineKeyboardButton("🔥 Провокатор", callback_data="mode_provocator")
         ],
         [
@@ -387,11 +393,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(user_id) in banned_players:
         return
 
-    # Задержка
-    last_time = last_message_time.get(user_id, 0)
-    if time.time() - last_time < 3:
-        await asyncio.sleep(3 - (time.time() - last_time))
-    last_message_time[user_id] = time.time()
+    # === ТУРБО-РЕЖИМ (ОТКЛЮЧЕНИЕ ЗАДЕРЖКИ) ===
+    if not turbo_mode.get(user_id, False):
+        last_time = last_message_time.get(user_id, 0)
+        if time.time() - last_time < 3:
+            await asyncio.sleep(3 - (time.time() - last_time))
+        last_message_time[user_id] = time.time()
 
     text = None
     if message.text:
@@ -413,7 +420,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
-    # === Команды ===
+    # === КОМАНДЫ ===
     if text.startswith("/"):
         if text.lower().startswith("/stop"):
             await stop_session(update, context)
@@ -437,11 +444,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             return
 
-    # === Определяем тон ===
+    # === ГОРЯЧИЕ КЛАВИШИ (+ / -) ===
+    if text.startswith("+"):
+        text = text[1:].strip()
+        sender = "me"
+    elif text.startswith("-"):
+        text = text[1:].strip()
+        sender = "him"
+    else:
+        sender = None
+
+    # === ОПРЕДЕЛЯЕМ ТОН ===
     tone = analyze_tone(text)
     context.user_data["current_tone"] = tone
 
-    # === Если есть активная сессия ===
+    # === ЕСЛИ ЕСТЬ АКТИВНАЯ СЕССИЯ ===
     if user_id in session_data:
         session = session_data[user_id]
         if not session.get("target_id"):
@@ -449,8 +466,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[user_id] = {"step": "waiting_target"}
             return
 
-        # === Уточнение отправителя ===
-        if user_id not in context.user_data.get("sender_confirmed", {}):
+        # === УТОЧНЕНИЕ ОТПРАВИТЕЛЯ (если не указан через + / -) ===
+        if sender is None and user_id not in context.user_data.get("sender_confirmed", {}):
             await update.message.reply_text(
                 f"❓ Это сообщение от вас или от оппонента ({session.get('target_name')})?",
                 reply_markup=get_sender_keyboard()
@@ -459,14 +476,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["pending_tone"] = tone
             return
 
-        # === Обработка сообщения ===
-        # Склеиваем, если есть очередь
+        # === ОБРАБОТКА СООБЩЕНИЯ ===
+        if sender == "him" or (sender is None and context.user_data.get("sender_confirmed")):
+            session["history"].append({"role": "opponent", "text": text, "timestamp": datetime.now().isoformat()})
+            # === АВТОДОБАВЛЕНИЕ СЛАБЫХ МЕСТ ===
+            await update_weak_points(session.get("target_name"), text)
+        elif sender == "me":
+            session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
+            await update.message.reply_text("✅ Ваше сообщение сохранено как контекст.")
+            return
+
+        # === ОЧЕРЕДЬ СООБЩЕНИЙ ===
         if user_id in message_queue and message_queue[user_id]:
             message_queue[user_id].append(text)
             await update.message.reply_text(
-                f"📝 Сообщение добавлено в очередь. Всего: {len(message_queue[user_id])}. Нажмите «Готово», чтобы проанализировать.",
+                f"📝 Сообщение добавлено в очередь. Всего: {len(message_queue[user_id])}. "
+                "Нажмите «Готово» или ждите 5 секунд для автоанализа.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="action_process_queue")]])
             )
+            # === АВТОСКЛЕЙКА ПО ТАЙМЕРУ ===
+            asyncio.create_task(auto_process_queue(update, context, user_id))
             return
         else:
             message_queue[user_id] = [text]
@@ -474,10 +503,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📝 Сообщение добавлено. Отправьте ещё или нажмите «Готово».",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="action_process_queue")]])
             )
+            asyncio.create_task(auto_process_queue(update, context, user_id))
             return
 
-    # === Новая сессия ===
+    # === НОВАЯ СЕССИЯ ===
     await auto_detect_target(update, context, text)
+
+async def auto_process_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    """Автоматическая обработка очереди через 5 секунд"""
+    await asyncio.sleep(5)
+    if user_id in message_queue and message_queue[user_id]:
+        full_text = "\n".join(message_queue[user_id])
+        message_queue[user_id] = []
+        await generate_response(update, context, full_text)
+
+async def update_weak_points(player_id: str, text: str):
+    """Автоматически определяет и сохраняет слабые места оппонента"""
+    weak_candidates = ["скилл", "игра", "кда", "мам", "возраст", "интеллект", "логика", "словарный"]
+    found = []
+    for word in weak_candidates:
+        if word in text.lower():
+            found.append(word)
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    for point in found:
+        c.execute("INSERT INTO weak_points (player_id, weak_point, count) VALUES (?, ?, 1) ON CONFLICT(player_id, weak_point) DO UPDATE SET count = count + 1", (player_id, point))
+    conn.commit()
+    conn.close()
 
 async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     user_id = update.effective_user.id
@@ -521,7 +574,6 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         session["history"] = session["history"][-20:]
     save_session_to_db(user_id, session)
 
-    # Получаем тон
     tone = context.user_data.get("current_tone", "neutral")
 
     styles = {
@@ -542,13 +594,21 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     conn.close()
     weak_points = [row[0] for row in weak_rows] if weak_rows else ["неизвестно"]
 
+    # === ПОДДЕРЖКА ЭМОДЗИ ===
+    emojis = re.findall(r'[\U0001F600-\U0001F64F]', text)
+    emoji_str = " ".join(emojis) if emojis else ""
+
+    # === ПЕРЕКЛЮЧАТЕЛЬ «МНОГО / ОДИН» ===
+    count = count_mode.get(user_id, 5)  # по умолчанию 5
+
     prompt = (
         f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
         f"Сообщение: \"{text}\". Режим: {mode} ({styles.get(mode, mode)}). "
         f"Тон сообщения: {tone}. Слабые места оппонента: {', '.join(weak_points)}. "
+        f"Эмодзи в сообщении: {emoji_str}. "
         f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
         f"Сделай ответ максимально колким, логичным и неожиданным. "
-        f"Твоя задача: сгенерировать 5 вариантов ответа (до 20 слов каждый), "
+        f"Твоя задача: сгенерировать {count} вариантов ответа (до 20 слов каждый), "
         f"которые уничтожат оппонента, используя его же логику и слабые места. "
         f"Варианты:"
     )
@@ -560,14 +620,13 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 
     options = reply.split("\n")
     options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
-    if len(options) < 3:
-        options = options + ["Вариант 1: " + reply, "Вариант 2: " + reply, "Вариант 3: " + reply]
-    options = options[:5]
+    if len(options) < count:
+        options = options + [f"Вариант {i+1}: " + reply for i in range(count - len(options))]
+    options = options[:count]
 
     context.user_data["last_options"] = options
     context.user_data["last_prompt"] = prompt
 
-    # Стратегии
     strategies = [
         "Сейчас лучше ответить холодно — он потеряет контроль.",
         "Используй сарказм — он не выдержит насмешки.",
@@ -579,13 +638,19 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ]
     strategy = random.choice(strategies)
 
-    # Кнопки для 5 вариантов
+    # === РЕЖИМ КОПИРОВАНИЯ ===
+    if copy_mode.get(user_id, False):
+        # Выдаём только чистый текст первого варианта
+        await update.message.reply_text(f"📋 {options[0]}")
+        return
+
+    # Обычный режим с кнопками
     buttons = []
-    for i in range(5):
+    for i in range(count):
         buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
     keyboard = [buttons]
     keyboard.append([
-        InlineKeyboardButton("🔄 Ещё 5 вариантов", callback_data="action_more"),
+        InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
         InlineKeyboardButton("🔙 Назад", callback_data="action_back")
     ])
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -598,7 +663,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"\n\n💡 Стратегия: {strategy}\n\n"
         f"Выберите вариант или сгенерируйте новые:",
         reply_markup=reply_markup
-    )
+            )
 
 def calculate_degree(text):
     score = 0
@@ -624,24 +689,28 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx = int(data.replace("choose_", ""))
         options = context.user_data.get("last_options", [])
         if idx < len(options):
-            await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
+            if copy_mode.get(user_id, False):
+                await query.edit_message_text(f"📋 {options[idx]}")
+            else:
+                await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
         return
 
-    # === Ещё 5 вариантов ===
+    # === Ещё варианты ===
     if data == "action_more":
         prompt = context.user_data.get("last_prompt", "")
         if prompt:
-            reply = call_hf_with_fallback(prompt + " Дай ещё 5 вариантов (новых).")
+            reply = call_hf_with_fallback(prompt + " Дай ещё варианты (новые).")
             if reply:
                 options = reply.split("\n")
-                options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5][:5]
+                count = count_mode.get(user_id, 5)
+                options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5][:count]
                 context.user_data["last_options"] = options
                 buttons = []
-                for i in range(5):
+                for i in range(count):
                     buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
                 keyboard = [buttons]
                 keyboard.append([
-                    InlineKeyboardButton("🔄 Ещё 5 вариантов", callback_data="action_more"),
+                    InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
                     InlineKeyboardButton("🔙 Назад", callback_data="action_back")
                 ])
                 reply_markup = InlineKeyboardMarkup(keyboard)
@@ -666,11 +735,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if sender == "him":
-            # Сохраняем сообщение как от оппонента
             session["history"].append({"role": "opponent", "text": pending_text, "timestamp": datetime.now().isoformat()})
             await query.edit_message_text(f"✅ Сообщение от {session.get('target_name')} сохранено.")
             context.user_data["sender_confirmed"] = True
-            # Генерируем ответ
+            await update_weak_points(session.get("target_name"), pending_text)
             await generate_response(update, context, pending_text)
         elif sender == "me":
             session["history"].append({"role": "user", "text": pending_text, "timestamp": datetime.now().isoformat()})
@@ -690,6 +758,20 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         message_queue[user_id] = []
         await query.edit_message_text("📝 Анализирую накопленные сообщения...")
         await generate_response(update, context, full_text)
+        return
+
+    # === РЕЖИМ КОПИРОВАНИЯ ===
+    if data == "action_copy_mode":
+        copy_mode[user_id] = not copy_mode.get(user_id, False)
+        status = "включён" if copy_mode[user_id] else "выключен"
+        await query.edit_message_text(f"📋 Режим копирования {status}. Теперь бот будет выдавать только чистые ответы.")
+        return
+
+    # === ТУРБО-РЕЖИМ ===
+    if data == "action_turbo":
+        turbo_mode[user_id] = not turbo_mode.get(user_id, False)
+        status = "включён" if turbo_mode[user_id] else "выключен"
+        await query.edit_message_text(f"⚡ Турбо-режим {status}. Задержка убрана.")
         return
 
     # === Остальные действия ===
@@ -780,6 +862,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "• Статистик — статистика по оппоненту\n\n"
             "📊 Тон — анализ агрессии, сарказма, пассивности.\n"
             "📤 Экспорт — выгрузка диалога в CSV.\n"
+            "📋 Копирование — чистые ответы без кнопок.\n"
+            "⚡ Турбо — отключение задержки.\n"
             "⏹ Завершить сессию — остановить анализ."
         )
         return
@@ -806,11 +890,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 Как я работаю:\n"
         "1. Отправьте сообщение оппонента (скопируйте из игры).\n"
         "2. Я определю цель или попрошу уточнить.\n"
-        "3. Я анализирую тон и предлагаю 5 вариантов ответа.\n"
+        "3. Я анализирую тон и предлагаю варианты ответа.\n"
         "4. Вы выбираете вариант или генерируете новые.\n\n"
+        "🔥 Горячие клавиши:\n"
+        "➕ `+текст` — сообщение от вас (контекст)\n"
+        "➖ `-текст` — сообщение от оппонента (анализ)\n\n"
         "🎭 Режимы: Логик, Зеркало, Сарказм, Провокатор, Психолог, Хаос, Статистик.\n"
         "📊 Тон — анализ агрессии, сарказма, пассивности.\n"
         "📤 Экспорт — выгрузка диалога в CSV.\n"
+        "📋 Копирование — чистые ответы без кнопок.\n"
+        "⚡ Турбо — отключение задержки.\n"
         "⏹ Завершить сессию — остановить анализ.\n\n"
         "Нажмите кнопку, чтобы начать:",
         reply_markup=get_main_keyboard()
@@ -849,7 +938,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_command))
 
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|sender_|action_)"))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|sender_|action_|count_)"))
 
     logger.info("Бот запущен с полной функциональностью (HF + OpenRouter)...")
     app.run_polling()
