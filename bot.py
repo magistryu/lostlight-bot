@@ -220,19 +220,19 @@ def call_openrouter(prompt):
         logger.warning("OPENROUTER_KEY не задан")
         return None
     try:
-        url = "https://openrouter.ai/api/v1/chat/completions"
+        url = "https://api.ru-openrouter.ru/v1/chat/completions"
         headers = {
             "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "openrouter/free",
+            "model": "openai/gpt-4o-mini",  # Бесплатная модель
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 50,
+            "max_tokens": 50000,  # Важно: минимум 50000 для полного ответа
             "temperature": 0.85
         }
-        logger.info("🔵 Отправка запроса в OpenRouter")
-        resp = requests.post(url, json=payload, headers=headers, timeout=20)
+        logger.info("🔵 Отправка запроса в OpenRouter (ru-openrouter.ru)")
+        resp = requests.post(url, json=payload, headers=headers, timeout=30)
         logger.info(f"🔵 OpenRouter ответ: статус {resp.status_code}")
         logger.info(f"🔵 OpenRouter тело: {resp.text[:500]}")
         if resp.status_code == 200:
