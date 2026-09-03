@@ -38,6 +38,17 @@ OPENROUTER_KEY = os.getenv("OPENROUTER_KEY", None)
 if not TELEGRAM_TOKEN:
     raise ValueError("TELEGRAM_TOKEN не задан")
 
+# ===== РАСПИСАНИЕ РАБОТЫ (МОСКОВСКОЕ ВРЕМЯ) =====
+WORK_START_HOUR = 7   # 07:00 МСК = 04:00 UTC
+WORK_END_HOUR = 23    # 23:00 МСК = 20:00 UTC
+
+def is_working_time():
+    """Проверяет, сейчас рабочее время или нет (по UTC)"""
+    now_utc = datetime.now(timezone.utc)
+    current_hour = now_utc.hour
+    # UTC время: 04:00 – 20:00 (соответствует МСК 07:00 – 23:00)
+    return 4 <= current_hour < 20
+
 # ===== БАЗА ДАННЫХ =====
 DB_PATH = "memory.db"
 def init_db():
@@ -226,9 +237,9 @@ def call_openrouter(prompt):
             "Content-Type": "application/json"
         }
         payload = {
-            "model": "openai/gpt-4o-mini",  # Бесплатная модель
+            "model": "openai/gpt-4o-mini",
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 50000,  # Важно: минимум 50000 для полного ответа
+            "max_tokens": 50000,
             "temperature": 0.85
         }
         logger.info("🔵 Отправка запроса в OpenRouter (ru-openrouter.ru)")
@@ -249,13 +260,11 @@ def call_openrouter(prompt):
         logger.error(f"OpenRouter failed: {e}")
         return None
 
-# ===== ОБНОВЛЁННЫЙ ВЫЗОВ (СНАЧАЛА OPENROUTER, ПОТОМ HF) =====
 def call_hf_with_fallback(prompt):
     queue_status = queue_request(prompt)
     if queue_status:
         return queue_status
 
-    # 1. СНАЧАЛА ПРОБУЕМ OPENROUTER (основной)
     if OPENROUTER_KEY:
         logger.info("Пробуем OpenRouter (основной)...")
         reply = call_openrouter(prompt)
@@ -265,7 +274,6 @@ def call_hf_with_fallback(prompt):
         else:
             logger.warning("❌ OpenRouter не ответил")
 
-    # 2. ЕСЛИ OPENROUTER НЕ ОТВЕТИЛ — ПРОБУЕМ HF
     for model in HF_MODELS:
         logger.info(f"Пробуем HF модель: {model}")
         reply = call_hf(prompt, model)
@@ -490,7 +498,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if sender == "him":
             session["history"].append({"role": "opponent", "text": text, "timestamp": datetime.now().isoformat()})
             await update_weak_points(session.get("target_name"), text)
-            # === ГЕНЕРИРУЕМ ОТВЕТ С КЛАВИАТУРОЙ ===
             await generate_response(update, context, text)
             return
         elif sender == "me":
@@ -545,9 +552,8 @@ async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         user_sessions[user_id] = {"step": "waiting_target"}
 
-# ===== ГЕНЕРАЦИЯ ОТВЕТА (ИСПРАВЛЕННАЯ) =====
+# ===== ГЕНЕРАЦИЯ ОТВЕТА =====
 async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    # === ОПРЕДЕЛЯЕМ, ОТКУДА ПРИШЁЛ ЗАПРОС (кнопка или сообщение) ===
     if update.callback_query:
         effective_message = update.callback_query.message
     else:
@@ -617,7 +623,6 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Варианты:"
     )
 
-    # === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
     await effective_message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
 
     logger.info("🔵 Вызов call_hf_with_fallback()")
@@ -701,7 +706,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
 
-    # === КНОПКИ ГЛАВНОГО МЕНЮ ===
     if data == "action_mode":
         await query.edit_message_text("🎭 Выберите режим:", reply_markup=get_mode_keyboard())
         return
@@ -789,7 +793,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("📝 Введите имя цели: /target <имя>")
         return
 
-    # === ВЫБОР ВАРИАНТА ===
     if data.startswith("choose_"):
         idx = int(data.replace("choose_", ""))
         options = context.user_data.get("last_options", [])
@@ -798,14 +801,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"📋 {options[idx]}")
             else:
                 await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
-            # === ВОЗВРАЩАЕМ КЛАВИАТУРУ ===
             await update.effective_message.reply_text(
                 "Выберите следующее действие:",
                 reply_markup=get_main_keyboard()
             )
         return
 
-    # === ЕЩЁ ВАРИАНТЫ ===
     if data == "action_more":
         prompt = context.user_data.get("last_prompt", "")
         if prompt:
@@ -838,7 +839,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         return
 
-    # === УТОЧНЕНИЕ ОТПРАВИТЕЛЯ ===
     if data.startswith("sender_"):
         sender = data.replace("sender_", "")
         session = session_data.get(user_id)
@@ -866,7 +866,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("pending_message", None)
         return
 
-    # === КОЛИЧЕСТВО ВАРИАНТОВ ===
     if data.startswith("count_"):
         count = int(data.replace("count_", ""))
         count_mode[user_id] = count
@@ -876,7 +875,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # === РЕЖИМЫ ===
     if data.startswith("mode_"):
         mode = data.replace("mode_", "")
         if user_id in session_data:
@@ -908,11 +906,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-# ===== ОСТАНОВКА СЕССИИ (ИСПРАВЛЕННАЯ) =====
+# ===== ОСТАНОВКА СЕССИИ =====
 async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
-    # === ОПРЕДЕЛЯЕМ, ОТКУДА ПРИШЁЛ ЗАПРОС ===
     if update.callback_query:
         effective_message = update.callback_query.message
     else:
@@ -973,6 +970,12 @@ async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===== ЗАПУСК =====
 def main():
     init_db()
+    
+    # === ПРОВЕРКА РАБОЧЕГО ВРЕМЕНИ ===
+    if not is_working_time():
+        logger.info("⏰ Бот остановлен (не рабочее время). Следующий запуск в 04:00 UTC.")
+        return  # Просто выходим, контейнер завершится
+    
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
@@ -982,7 +985,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|sender_|action_|count_)"))
 
-    logger.info("Бот запущен с полной функциональностью (OpenRouter основной)...")
+    logger.info("Бот запущен (рабочее время)")
     app.run_polling()
 
 if __name__ == "__main__":
