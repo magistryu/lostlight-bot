@@ -214,7 +214,7 @@ def call_hf(prompt, model):
         logger.error(f"HF model {model} failed: {e}")
         return None
 
-# ===== ВЫЗОВ OPENROUTER (С ЛОГИРОВАНИЕМ) =====
+# ===== ВЫЗОВ OPENROUTER (ОСНОВНОЙ) =====
 def call_openrouter(prompt):
     if not OPENROUTER_KEY:
         logger.warning("OPENROUTER_KEY не задан")
@@ -249,10 +249,23 @@ def call_openrouter(prompt):
         logger.error(f"OpenRouter failed: {e}")
         return None
 
+# ===== ОБНОВЛЁННЫЙ ВЫЗОВ (СНАЧАЛА OPENROUTER, ПОТОМ HF) =====
 def call_hf_with_fallback(prompt):
     queue_status = queue_request(prompt)
     if queue_status:
         return queue_status
+
+    # 1. СНАЧАЛА ПРОБУЕМ OPENROUTER (основной)
+    if OPENROUTER_KEY:
+        logger.info("Пробуем OpenRouter (основной)...")
+        reply = call_openrouter(prompt)
+        if reply:
+            logger.info("✅ Ответ от OpenRouter")
+            return reply
+        else:
+            logger.warning("❌ OpenRouter не ответил")
+
+    # 2. ЕСЛИ OPENROUTER НЕ ОТВЕТИЛ — ПРОБУЕМ HF
     for model in HF_MODELS:
         logger.info(f"Пробуем HF модель: {model}")
         reply = call_hf(prompt, model)
@@ -261,14 +274,7 @@ def call_hf_with_fallback(prompt):
             return reply
         else:
             logger.warning(f"❌ HF модель {model} не ответила")
-    if OPENROUTER_KEY:
-        logger.info("Пробуем OpenRouter...")
-        reply = call_openrouter(prompt)
-        if reply:
-            logger.info("✅ Ответ от OpenRouter")
-            return reply
-        else:
-            logger.warning("❌ OpenRouter не ответил")
+
     logger.warning("Все модели не ответили. Ответ не будет отправлен.")
     return None
 
@@ -539,88 +545,7 @@ async def auto_detect_target(update: Update, context: ContextTypes.DEFAULT_TYPE,
         )
         user_sessions[user_id] = {"step": "waiting_target"}
 
-async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
-    user_id = update.effective_user.id
-    session = session_data.get(user_id)
-    if not session:
-        return
-
-    target_name = session.get("target_name")
-    mode = session.get("mode", "логик")
-
-    session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
-    if len(session["history"]) > 20:
-        session["history"] = session["history"][-20:]
-    save_session_to_db(user_id, session)
-
-    tone = analyze_tone(text)
-    context.user_data["current_tone"] = tone
-
-    styles = {
-        "логик": "логический анализ, разбор аргументов",
-        "зеркало": "копирование стиля с переворотом смысла",
-        "сарказм": "уничтожение через иронию",
-        "провокатор": "вызов эмоций, провокация",
-        "психолог": "анализ поведения с юмором",
-        "хаос": "абсурдные, но логически связанные ответы",
-        "статистик": "статистика по оппоненту"
-    }
-
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT weak_point FROM weak_points WHERE player_id=?", (target_name,))
-    weak_rows = c.fetchall()
-    conn.close()
-    weak_points = [row[0] for row in weak_rows] if weak_rows else ["неизвестно"]
-
-    emojis = re.findall(r'[\U0001F600-\U0001F64F]', text)
-    emoji_str = " ".join(emojis) if emojis else ""
-
-    count = count_mode.get(user_id, 5)
-
-    mode_instructions = {
-        "логик": "Разбери его аргументы и покажи, что они нелогичны.",
-        "зеркало": "Скопируй его стиль, но переверни смысл.",
-        "сарказм": "Ответь с иронией, уничтожь его насмешкой.",
-        "провокатор": "Спровоцируй его на эмоции, чтобы он ошибся.",
-        "психолог": "Проанализируй его поведение с юмором.",
-        "хаос": "Дай абсурдный, но логически связанный ответ.",
-        "статистик": "Покажи статистику его слабых мест."
-    }
-
-    prompt = (
-        f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
-        f"Сообщение: \"{text}\". Режим: {mode} ({styles.get(mode, mode)}). "
-        f"Тон сообщения: {tone}. Слабые места оппонента: {', '.join(weak_points)}. "
-        f"Эмодзи в сообщении: {emoji_str}. "
-        f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
-        f"Инструкция для режима: {mode_instructions.get(mode, 'Ответь колко и логично.')} "
-        f"Твоя задача: сгенерировать {count} вариантов ответа (до 20 слов каждый), "
-        f"которые уничтожат оппонента, используя его же логику и слабые места. "
-        f"Варианты:"
-    )
-
-    # === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
-    await update.message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
-
-    logger.info("🔵 Вызов call_hf_with_fallback()")
-    logger.info(f"🔵 Промпт: {prompt[:200]}...")
-
-    reply = call_hf_with_fallback(prompt)
-
-    logger.info(f"🔵 Ответ от call_hf_with_fallback: {reply}")
-
-    if not reply:
-        await update.message.reply_text(
-            "⚠️ Не удалось сгенерировать ответ. Попробуйте позже.",
-            reply_markup=get_main_keyboard()
-        )
-        return
-
-    options = reply.split("\n")
-    options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
-    if len(options) < count:
-        options = options + [f"Вариант {i+1}: " + reply for i in range(count - len(options))]
+# ===== ГЕНЕРАЦИЯ ОТВЕТА (ИСПРАВЛЕННАЯ) =====
 async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
     # === ОПРЕДЕЛЯЕМ, ОТКУДА ПРИШЁЛ ЗАПРОС (кнопка или сообщение) ===
     if update.callback_query:
@@ -831,10 +756,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "action_help":
         await query.edit_message_text(
             "👋 Я — бот-ассистент по троллингу.\n\n"
-            "🔥 Горячие клавиши:\n"
+            "📌 КАК РАБОТАТЬ:\n"
+            "1. Установите цель — бот сам определит имя из первого сообщения или напишите /target <имя>.\n"
+            "2. Отправляйте сообщения оппонента (копируйте из игры и вставляйте).\n"
+            "3. Бот анализирует тон и выдаёт 5 вариантов ответа.\n"
+            "4. Выберите вариант или нажмите «Ещё» для новых.\n\n"
+            "🔥 ГОРЯЧИЕ КЛАВИШИ:\n"
             "➕ +текст — сообщение от вас (контекст)\n"
             "➖ -текст — сообщение от оппонента (анализ)\n\n"
-            "🎭 Режимы: Логик, Зеркало, Сарказм, Провокатор, Психолог, Хаос, Статистик.\n"
+            "🎭 РЕЖИМЫ:\n"
+            "• Логик — разбор аргументов\n"
+            "• Зеркало — переворот смысла\n"
+            "• Сарказм — ирония\n"
+            "• Провокатор — вызов эмоций\n"
+            "• Психолог — анализ с юмором\n"
+            "• Хаос — абсурдные ответы\n"
+            "• Статистик — статистика по оппоненту\n\n"
             "📊 Тон — анализ агрессии, сарказма, пассивности.\n"
             "📤 Экспорт — выгрузка диалога в CSV.\n"
             "📋 Копирование — чистые ответы без кнопок.\n"
@@ -971,14 +908,27 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+# ===== ОСТАНОВКА СЕССИИ (ИСПРАВЛЕННАЯ) =====
 async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
+    # === ОПРЕДЕЛЯЕМ, ОТКУДА ПРИШЁЛ ЗАПРОС ===
+    if update.callback_query:
+        effective_message = update.callback_query.message
+    else:
+        effective_message = update.message
+    
+    if not effective_message:
+        logger.error("Нет active message для завершения сессии")
+        return
+    
     if user_id in session_data:
         del session_data[user_id]
     if user_id in user_sessions:
         del user_sessions[user_id]
     sender_confirmed.pop(user_id, None)
-    await update.message.reply_text(
+    
+    await effective_message.reply_text(
         "⏹ Сессия завершена.\nДанные сохранены.",
         reply_markup=get_main_keyboard()
     )
@@ -1032,7 +982,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|sender_|action_|count_)"))
 
-    logger.info("Бот запущен с полной функциональностью...")
+    logger.info("Бот запущен с полной функциональностью (OpenRouter основной)...")
     app.run_polling()
 
 if __name__ == "__main__":
