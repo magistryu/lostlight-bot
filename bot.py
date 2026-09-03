@@ -621,6 +621,98 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
     if len(options) < count:
         options = options + [f"Вариант {i+1}: " + reply for i in range(count - len(options))]
+async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    # === ОПРЕДЕЛЯЕМ, ОТКУДА ПРИШЁЛ ЗАПРОС (кнопка или сообщение) ===
+    if update.callback_query:
+        effective_message = update.callback_query.message
+    else:
+        effective_message = update.message
+
+    if not effective_message:
+        logger.error("Нет active message для отправки ответа")
+        return
+
+    user_id = update.effective_user.id
+    session = session_data.get(user_id)
+    if not session:
+        return
+
+    target_name = session.get("target_name")
+    mode = session.get("mode", "логик")
+
+    session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
+    if len(session["history"]) > 20:
+        session["history"] = session["history"][-20:]
+    save_session_to_db(user_id, session)
+
+    tone = analyze_tone(text)
+    context.user_data["current_tone"] = tone
+
+    styles = {
+        "логик": "логический анализ, разбор аргументов",
+        "зеркало": "копирование стиля с переворотом смысла",
+        "сарказм": "уничтожение через иронию",
+        "провокатор": "вызов эмоций, провокация",
+        "психолог": "анализ поведения с юмором",
+        "хаос": "абсурдные, но логически связанные ответы",
+        "статистик": "статистика по оппоненту"
+    }
+
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT weak_point FROM weak_points WHERE player_id=?", (target_name,))
+    weak_rows = c.fetchall()
+    conn.close()
+    weak_points = [row[0] for row in weak_rows] if weak_rows else ["неизвестно"]
+
+    emojis = re.findall(r'[\U0001F600-\U0001F64F]', text)
+    emoji_str = " ".join(emojis) if emojis else ""
+
+    count = count_mode.get(user_id, 5)
+
+    mode_instructions = {
+        "логик": "Разбери его аргументы и покажи, что они нелогичны.",
+        "зеркало": "Скопируй его стиль, но переверни смысл.",
+        "сарказм": "Ответь с иронией, уничтожь его насмешкой.",
+        "провокатор": "Спровоцируй его на эмоции, чтобы он ошибся.",
+        "психолог": "Проанализируй его поведение с юмором.",
+        "хаос": "Дай абсурдный, но логически связанный ответ.",
+        "статистик": "Покажи статистику его слабых мест."
+    }
+
+    prompt = (
+        f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
+        f"Сообщение: \"{text}\". Режим: {mode} ({styles.get(mode, mode)}). "
+        f"Тон сообщения: {tone}. Слабые места оппонента: {', '.join(weak_points)}. "
+        f"Эмодзи в сообщении: {emoji_str}. "
+        f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
+        f"Инструкция для режима: {mode_instructions.get(mode, 'Ответь колко и логично.')} "
+        f"Твоя задача: сгенерировать {count} вариантов ответа (до 20 слов каждый), "
+        f"которые уничтожат оппонента, используя его же логику и слабые места. "
+        f"Варианты:"
+    )
+
+    # === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
+    await effective_message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
+
+    logger.info("🔵 Вызов call_hf_with_fallback()")
+    logger.info(f"🔵 Промпт: {prompt[:200]}...")
+
+    reply = call_hf_with_fallback(prompt)
+
+    logger.info(f"🔵 Ответ от call_hf_with_fallback: {reply}")
+
+    if not reply:
+        await effective_message.reply_text(
+            "⚠️ Не удалось сгенерировать ответ. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    options = reply.split("\n")
+    options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
+    if len(options) < count:
+        options = options + [f"Вариант {i+1}: " + reply for i in range(count - len(options))]
     options = options[:count]
 
     context.user_data["last_options"] = options
@@ -639,7 +731,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     strategy = random.choice(strategies)
 
     if copy_mode.get(user_id, False):
-        await update.message.reply_text(
+        await effective_message.reply_text(
             f"📋 {options[0]}",
             reply_markup=get_main_keyboard()
         )
@@ -655,7 +747,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ])
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
+    await effective_message.reply_text(
         f"🎯 Цель: {target_name} | Режим: {mode}\n"
         f"📊 Тон: {tone}\n\n"
         f"**Варианты ответа:**\n"
