@@ -615,14 +615,15 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "Используй абсурд — он не поймёт, как реагировать.",
         "Покажи статистику — это его слабое место."
     ]
-    strategy = random.choice(strategies)
 
-    if copy_mode.get(user_id, False):
-        await update.message.reply_text(
+strategy = random.choice(strategies)
+
+if copy_mode.get(user_id, False):
+    await update.message.reply_text(
         f"📋 {options[0]}",
-            reply_markup=get_main_keyboard()
-        )
-        return
+        reply_markup=get_main_keyboard()
+    )
+    return
 
 buttons = []
 for i in range(count):
@@ -634,15 +635,15 @@ keyboard.append([
 ])
 reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        f"🎯 Цель: {target_name} | Режим: {mode}\n"
-        f"📊 Тон: {tone}\n\n"
-        f"**Варианты ответа:**\n"
-        + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
-        f"\n\n💡 Стратегия: {strategy}\n\n"
-        f"Выберите вариант или сгенерируйте новые:",
-        reply_markup=reply_markup
-    )
+await update.message.reply_text(
+    f"🎯 Цель: {target_name} | Режим: {mode}\n"
+    f"📊 Тон: {tone}\n\n"
+    f"**Варианты ответа:**\n"
+    + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
+    f"\n\n💡 Стратегия: {strategy}\n\n"
+    f"Выберите вариант или сгенерируйте новые:",
+    reply_markup=reply_markup
+)
 
 def calculate_degree(text):
     score = 0
