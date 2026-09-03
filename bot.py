@@ -397,8 +397,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 forwarded_msg = await context.bot.forward_message(
                     chat_id=message.chat.id,
                     from_chat_id=message.forward_from_chat.id if message.forward_from_chat else message.chat.id,
-
-message_id=message.forward_from_message_id
+                    message_id=message.forward_from_message_id
                 )
                 text = forwarded_msg.text or forwarded_msg.caption
             except Exception as e:
@@ -448,7 +447,10 @@ message_id=message.forward_from_message_id
     if user_id in session_data:
         session = session_data[user_id]
         if not session.get("target_id"):
-            await update.message.reply_text("👤 С кем я общаюсь? Напишите имя цели.")
+            await update.message.reply_text(
+                "👤 С кем я общаюсь? Напишите имя цели.",
+                reply_markup=get_main_keyboard()
+            )
             user_sessions[user_id] = {"step": "waiting_target"}
             return
 
@@ -468,11 +470,15 @@ message_id=message.forward_from_message_id
         if sender == "him":
             session["history"].append({"role": "opponent", "text": text, "timestamp": datetime.now().isoformat()})
             await update_weak_points(session.get("target_name"), text)
+            # === ГЕНЕРИРУЕМ ОТВЕТ С КЛАВИАТУРОЙ ===
             await generate_response(update, context, text)
             return
         elif sender == "me":
             session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
-            await update.message.reply_text("✅ Ваше сообщение сохранено как контекст.")
+            await update.message.reply_text(
+                "✅ Ваше сообщение сохранено как контекст.",
+                reply_markup=get_main_keyboard()
+            )
             return
 
     # === НОВАЯ СЕССИЯ ===
@@ -580,9 +586,15 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Варианты:"
     )
 
+    # === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
+    await update.message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
+    
     reply = call_hf_with_fallback(prompt)
     if not reply:
-        await update.message.reply_text("⚠️ Не удалось сгенерировать ответ. Попробуйте позже.")
+        await update.message.reply_text(
+            "⚠️ Не удалось сгенерировать ответ. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
         return
 
     options = reply.split("\n")
@@ -605,8 +617,11 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ]
     strategy = random.choice(strategies)
 
-    if copy_mode.get(user_id, False):
-        await update.message.reply_text(f"📋 {options[0]}")
+        if copy_mode.get(user_id, False):
+        await update.message.reply_text(
+            f"📋 {options[0]}",
+            reply_markup=get_main_keyboard()
+        )
         return
 
     buttons = []
@@ -733,12 +748,18 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"📋 {options[idx]}")
             else:
                 await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
+            # === ВОЗВРАЩАЕМ КЛАВИАТУРУ ===
+            await update.effective_message.reply_text(
+                "Выберите следующее действие:",
+                reply_markup=get_main_keyboard()
+            )
         return
 
     # === ЕЩЁ ВАРИАНТЫ ===
     if data == "action_more":
         prompt = context.user_data.get("last_prompt", "")
         if prompt:
+            await query.edit_message_text("⏳ Генерирую новые варианты...")
             reply = call_hf_with_fallback(prompt + " Дай ещё варианты (новые).")
             if reply:
                 count = count_mode.get(user_id, 5)
@@ -759,6 +780,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
                     f"\n\nВыберите вариант:",
                     reply_markup=reply_markup
+                )
+            else:
+                await query.edit_message_text(
+                    "⚠️ Не удалось сгенерировать новые варианты.",
+                    reply_markup=get_main_keyboard()
                 )
         return
 
@@ -783,7 +809,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif sender == "me":
             sender_confirmed[user_id] = "me"
             session["history"].append({"role": "user", "text": pending_text, "timestamp": datetime.now().isoformat()})
-            await query.edit_message_text("✅ Ваше сообщение сохранено как контекст.")
+            await query.edit_message_text(
+                "✅ Ваше сообщение сохранено как контекст.",
+                reply_markup=get_main_keyboard()
+            )
         context.user_data.pop("pending_message", None)
         return
 
@@ -791,7 +820,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("count_"):
         count = int(data.replace("count_", ""))
         count_mode[user_id] = count
-        await query.edit_message_text(f"✅ Количество вариантов: {count}")
+        await query.edit_message_text(
+            f"✅ Количество вариантов: {count}",
+            reply_markup=get_main_keyboard()
+        )
         return
 
     # === РЕЖИМЫ ===
@@ -808,7 +840,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "psychologist": "Психолог",
             "chaos": "Хаос",
             "statistic": "Статистик"
-    }
+        }
         mode_descriptions = {
             "logic": "Разбираю аргументы по косточкам.",
             "mirror": "Копирую стиль, переворачиваю смысл.",
@@ -821,7 +853,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"✅ Режим **{mode_names.get(mode, mode)}** выбран.\n"
             f"{mode_descriptions.get(mode, '')}\n\n"
-            f"Продолжайте отправлять сообщения."
+            f"Продолжайте отправлять сообщения.",
+            reply_markup=get_main_keyboard()
         )
         return
 
@@ -866,7 +899,10 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_main_keyboard()
         )
     else:
-        await update.message.reply_text("❌ Укажите имя: /target <имя>")
+        await update.message.reply_text(
+            "❌ Укажите имя: /target <имя>",
+            reply_markup=get_main_keyboard()
+        )
 
 async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await stop_session(update, context)
