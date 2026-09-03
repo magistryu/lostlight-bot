@@ -617,12 +617,12 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ]
     strategy = random.choice(strategies)
 
-if copy_mode.get(user_id, False):
-    await update.message.reply_text(
+    if copy_mode.get(user_id, False):
+        await update.message.reply_text(
         f"📋 {options[0]}",
-        reply_markup=get_main_keyboard()
-    )
-    return
+            reply_markup=get_main_keyboard()
+        )
+        return
 
 buttons = []
 for i in range(count):
