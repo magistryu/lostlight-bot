@@ -131,22 +131,6 @@ def save_session_to_db(user_id, session):
     conn.commit()
     conn.close()
 
-def load_session_from_db(user_id):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT target_id, target_name, history, mode, created_at FROM sessions WHERE user_id=?", (str(user_id),))
-    row = c.fetchone()
-    conn.close()
-    if row:
-        return {
-            "target_id": row[0],
-            "target_name": row[1],
-            "history": json.loads(row[2]) if row[2] else [],
-            "mode": row[3] if row[3] else "логик",
-            "created_at": row[4] if row[4] else datetime.now().isoformat()
-        }
-    return None
-
 # ===== КЭШ =====
 CACHE_PATH = "cache.pkl"
 try:
@@ -313,9 +297,10 @@ banned_players = {}
 last_message_time = {}
 session_data = {}
 message_queue = {}
-turbo_mode = {}  # user_id -> bool
-copy_mode = {}  # user_id -> bool
-count_mode = {}  # user_id -> int (1, 3, 5)
+turbo_mode = {}
+copy_mode = {}
+count_mode = {}
+sender_confirmed = {}
 
 # ===== КНОПКИ =====
 def get_main_keyboard():
@@ -333,7 +318,10 @@ def get_main_keyboard():
             InlineKeyboardButton("⚡ Турбо", callback_data="action_turbo")
         ],
         [
-            InlineKeyboardButton("⏹ Завершить сессию", callback_data="action_stop"),
+            InlineKeyboardButton("🔢 Количество", callback_data="action_count"),
+            InlineKeyboardButton("⏹ Завершить сессию", callback_data="action_stop")
+        ],
+        [
             InlineKeyboardButton("❓ Помощь", callback_data="action_help")
         ]
     ]
@@ -346,7 +334,7 @@ def get_mode_keyboard():
             InlineKeyboardButton("🪞 Зеркало", callback_data="mode_mirror")
         ],
         [
-                        InlineKeyboardButton("😏 Сарказм", callback_data="mode_sarcasm"),
+            InlineKeyboardButton("😏 Сарказм", callback_data="mode_sarcasm"),
             InlineKeyboardButton("🔥 Провокатор", callback_data="mode_provocator")
         ],
         [
@@ -365,9 +353,6 @@ def get_sender_keyboard():
         [
             InlineKeyboardButton("👤 От меня", callback_data="sender_me"),
             InlineKeyboardButton("👤 От него", callback_data="sender_him")
-        ],
-        [
-            InlineKeyboardButton("❓ Не знаю", callback_data="sender_unknown")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -378,6 +363,9 @@ def get_count_keyboard():
             InlineKeyboardButton("1️⃣ Вариант", callback_data="count_1"),
             InlineKeyboardButton("3️⃣ Варианта", callback_data="count_3"),
             InlineKeyboardButton("5️⃣ Вариантов", callback_data="count_5")
+        ],
+        [
+            InlineKeyboardButton("🔙 Назад", callback_data="action_back")
         ]
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -393,7 +381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if str(user_id) in banned_players:
         return
 
-    # === ТУРБО-РЕЖИМ (ОТКЛЮЧЕНИЕ ЗАДЕРЖКИ) ===
+    # === ТУРБО-РЕЖИМ ===
     if not turbo_mode.get(user_id, False):
         last_time = last_message_time.get(user_id, 0)
         if time.time() - last_time < 3:
@@ -409,10 +397,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 forwarded_msg = await context.bot.forward_message(
                     chat_id=message.chat.id,
                     from_chat_id=message.forward_from_chat.id if message.forward_from_chat else message.chat.id,
-                    message_id=message.forward_from_message_id
+
+message_id=message.forward_from_message_id
                 )
-                text = forwarded_msg.text
-            except:
+                text = forwarded_msg.text or forwarded_msg.caption
+            except Exception as e:
+                logger.error(f"Ошибка пересылки: {e}")
                 text = "⚠️ Не удалось получить текст пересланного сообщения."
         else:
             text = "⚠️ Пересланное сообщение без текста."
@@ -454,10 +444,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         sender = None
 
-    # === ОПРЕДЕЛЯЕМ ТОН ===
-    tone = analyze_tone(text)
-    context.user_data["current_tone"] = tone
-
     # === ЕСЛИ ЕСТЬ АКТИВНАЯ СЕССИЯ ===
     if user_id in session_data:
         session = session_data[user_id]
@@ -466,59 +452,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_sessions[user_id] = {"step": "waiting_target"}
             return
 
-        # === УТОЧНЕНИЕ ОТПРАВИТЕЛЯ (если не указан через + / -) ===
-        if sender is None and user_id not in context.user_data.get("sender_confirmed", {}):
+        # === УТОЧНЕНИЕ ОТПРАВИТЕЛЯ ===
+        if sender is None and not sender_confirmed.get(user_id, False):
             await update.message.reply_text(
                 f"❓ Это сообщение от вас или от оппонента ({session.get('target_name')})?",
                 reply_markup=get_sender_keyboard()
             )
             context.user_data["pending_message"] = text
-            context.user_data["pending_tone"] = tone
             return
 
+        if sender is None:
+            sender = "him" if sender_confirmed.get(user_id) == "him" else "me"
+
         # === ОБРАБОТКА СООБЩЕНИЯ ===
-        if sender == "him" or (sender is None and context.user_data.get("sender_confirmed")):
+        if sender == "him":
             session["history"].append({"role": "opponent", "text": text, "timestamp": datetime.now().isoformat()})
-            # === АВТОДОБАВЛЕНИЕ СЛАБЫХ МЕСТ ===
             await update_weak_points(session.get("target_name"), text)
+            await generate_response(update, context, text)
+            return
         elif sender == "me":
             session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
             await update.message.reply_text("✅ Ваше сообщение сохранено как контекст.")
             return
 
-        # === ОЧЕРЕДЬ СООБЩЕНИЙ ===
-        if user_id in message_queue and message_queue[user_id]:
-            message_queue[user_id].append(text)
-            await update.message.reply_text(
-                f"📝 Сообщение добавлено в очередь. Всего: {len(message_queue[user_id])}. "
-                "Нажмите «Готово» или ждите 5 секунд для автоанализа.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="action_process_queue")]])
-            )
-            # === АВТОСКЛЕЙКА ПО ТАЙМЕРУ ===
-            asyncio.create_task(auto_process_queue(update, context, user_id))
-            return
-        else:
-            message_queue[user_id] = [text]
-            await update.message.reply_text(
-                "📝 Сообщение добавлено. Отправьте ещё или нажмите «Готово».",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ Готово", callback_data="action_process_queue")]])
-            )
-            asyncio.create_task(auto_process_queue(update, context, user_id))
-            return
-
     # === НОВАЯ СЕССИЯ ===
     await auto_detect_target(update, context, text)
 
-async def auto_process_queue(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """Автоматическая обработка очереди через 5 секунд"""
-    await asyncio.sleep(5)
-    if user_id in message_queue and message_queue[user_id]:
-        full_text = "\n".join(message_queue[user_id])
-        message_queue[user_id] = []
-        await generate_response(update, context, full_text)
-
 async def update_weak_points(player_id: str, text: str):
-    """Автоматически определяет и сохраняет слабые места оппонента"""
     weak_candidates = ["скилл", "игра", "кда", "мам", "возраст", "интеллект", "логика", "словарный"]
     found = []
     for word in weak_candidates:
@@ -568,13 +528,13 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     target_name = session.get("target_name")
     mode = session.get("mode", "логик")
 
-    # Сохраняем в историю
     session["history"].append({"role": "user", "text": text, "timestamp": datetime.now().isoformat()})
     if len(session["history"]) > 20:
         session["history"] = session["history"][-20:]
     save_session_to_db(user_id, session)
 
-    tone = context.user_data.get("current_tone", "neutral")
+    tone = analyze_tone(text)
+    context.user_data["current_tone"] = tone
 
     styles = {
         "логик": "логический анализ, разбор аргументов",
@@ -586,7 +546,6 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         "статистик": "статистика по оппоненту"
     }
 
-    # Получаем слабые места
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("SELECT weak_point FROM weak_points WHERE player_id=?", (target_name,))
@@ -594,12 +553,20 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     conn.close()
     weak_points = [row[0] for row in weak_rows] if weak_rows else ["неизвестно"]
 
-    # === ПОДДЕРЖКА ЭМОДЗИ ===
     emojis = re.findall(r'[\U0001F600-\U0001F64F]', text)
     emoji_str = " ".join(emojis) if emojis else ""
 
-    # === ПЕРЕКЛЮЧАТЕЛЬ «МНОГО / ОДИН» ===
-    count = count_mode.get(user_id, 5)  # по умолчанию 5
+    count = count_mode.get(user_id, 5)
+
+    mode_instructions = {
+        "логик": "Разбери его аргументы и покажи, что они нелогичны.",
+        "зеркало": "Скопируй его стиль, но переверни смысл.",
+        "сарказм": "Ответь с иронией, уничтожь его насмешкой.",
+        "провокатор": "Спровоцируй его на эмоции, чтобы он ошибся.",
+        "психолог": "Проанализируй его поведение с юмором.",
+        "хаос": "Дай абсурдный, но логически связанный ответ.",
+        "статистик": "Покажи статистику его слабых мест."
+    }
 
     prompt = (
         f"Ты — бот-ассистент по троллингу. Оппонент: {target_name}. "
@@ -607,7 +574,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Тон сообщения: {tone}. Слабые места оппонента: {', '.join(weak_points)}. "
         f"Эмодзи в сообщении: {emoji_str}. "
         f"История диалога (последние 3 сообщения): {json.dumps(session['history'][-3:])}. "
-        f"Сделай ответ максимально колким, логичным и неожиданным. "
+        f"Инструкция для режима: {mode_instructions.get(mode, 'Ответь колко и логично.')} "
         f"Твоя задача: сгенерировать {count} вариантов ответа (до 20 слов каждый), "
         f"которые уничтожат оппонента, используя его же логику и слабые места. "
         f"Варианты:"
@@ -638,13 +605,10 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     ]
     strategy = random.choice(strategies)
 
-    # === РЕЖИМ КОПИРОВАНИЯ ===
     if copy_mode.get(user_id, False):
-        # Выдаём только чистый текст первого варианта
         await update.message.reply_text(f"📋 {options[0]}")
         return
 
-    # Обычный режим с кнопками
     buttons = []
     for i in range(count):
         buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
@@ -663,7 +627,7 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"\n\n💡 Стратегия: {strategy}\n\n"
         f"Выберите вариант или сгенерируйте новые:",
         reply_markup=reply_markup
-            )
+    )
 
 def calculate_degree(text):
     score = 0
@@ -684,133 +648,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
 
-    # === Выбор варианта ===
-    if data.startswith("choose_"):
-        idx = int(data.replace("choose_", ""))
-        options = context.user_data.get("last_options", [])
-        if idx < len(options):
-            if copy_mode.get(user_id, False):
-                await query.edit_message_text(f"📋 {options[idx]}")
-            else:
-                await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
-        return
-
-    # === Ещё варианты ===
-    if data == "action_more":
-        prompt = context.user_data.get("last_prompt", "")
-        if prompt:
-            reply = call_hf_with_fallback(prompt + " Дай ещё варианты (новые).")
-            if reply:
-                options = reply.split("\n")
-                count = count_mode.get(user_id, 5)
-                options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5][:count]
-                context.user_data["last_options"] = options
-                buttons = []
-                for i in range(count):
-                    buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
-                keyboard = [buttons]
-                keyboard.append([
-                    InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
-                    InlineKeyboardButton("🔙 Назад", callback_data="action_back")
-                ])
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                await query.edit_message_text(
-                    f"🎯 Новые варианты:\n\n"
-                    + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
-                    f"\n\nВыберите вариант:",
-                    reply_markup=reply_markup
-                )
-        return
-
-    # === Уточнение отправителя ===
-    if data.startswith("sender_"):
-        sender = data.replace("sender_", "")
-        session = session_data.get(user_id)
-        if not session:
-            await query.edit_message_text("❌ Нет активной сессии.")
-            return
-        pending_text = context.user_data.get("pending_message")
-        if not pending_text:
-            await query.edit_message_text("❌ Нет сообщения для обработки.")
-            return
-
-        if sender == "him":
-            session["history"].append({"role": "opponent", "text": pending_text, "timestamp": datetime.now().isoformat()})
-            await query.edit_message_text(f"✅ Сообщение от {session.get('target_name')} сохранено.")
-            context.user_data["sender_confirmed"] = True
-            await update_weak_points(session.get("target_name"), pending_text)
-            await generate_response(update, context, pending_text)
-        elif sender == "me":
-            session["history"].append({"role": "user", "text": pending_text, "timestamp": datetime.now().isoformat()})
-            await query.edit_message_text("✅ Ваше сообщение сохранено как контекст.")
-            context.user_data["sender_confirmed"] = True
-        else:
-            await query.edit_message_text("❌ Не удалось определить отправителя. Попробуйте ещё раз.")
-        context.user_data.pop("pending_message", None)
-        return
-
-    # === Обработка очереди ===
-    if data == "action_process_queue":
-        if user_id not in message_queue or not message_queue[user_id]:
-            await query.edit_message_text("❌ Очередь пуста.")
-            return
-        full_text = "\n".join(message_queue[user_id])
-        message_queue[user_id] = []
-        await query.edit_message_text("📝 Анализирую накопленные сообщения...")
-        await generate_response(update, context, full_text)
-        return
-
-    # === РЕЖИМ КОПИРОВАНИЯ ===
-    if data == "action_copy_mode":
-        copy_mode[user_id] = not copy_mode.get(user_id, False)
-        status = "включён" if copy_mode[user_id] else "выключен"
-        await query.edit_message_text(f"📋 Режим копирования {status}. Теперь бот будет выдавать только чистые ответы.")
-        return
-
-    # === ТУРБО-РЕЖИМ ===
-    if data == "action_turbo":
-        turbo_mode[user_id] = not turbo_mode.get(user_id, False)
-        status = "включён" if turbo_mode[user_id] else "выключен"
-        await query.edit_message_text(f"⚡ Турбо-режим {status}. Задержка убрана.")
-        return
-
-    # === Остальные действия ===
-    if data == "action_change_target":
-        await query.edit_message_text("📝 Введите имя цели вручную:\nНапишите: /target <имя>")
-        return
-
+    # === КНОПКИ ГЛАВНОГО МЕНЮ ===
     if data == "action_mode":
-        await query.edit_message_text("🎭 Выберите режим троллинга:", reply_markup=get_mode_keyboard())
-        return
-
-    if data.startswith("mode_"):
-        mode = data.replace("mode_", "")
-        if user_id in session_data:
-            session_data[user_id]["mode"] = mode
-            save_session_to_db(user_id, session_data[user_id])
-        mode_names = {
-            "logic": "Логик",
-            "mirror": "Зеркало",
-            "sarcasm": "Сарказм",
-            "provocator": "Провокатор",
-            "psychologist": "Психолог",
-            "chaos": "Хаос",
-            "statistic": "Статистик"
-        }
-        mode_descriptions = {
-            "logic": "Разбираю аргументы по косточкам, уничтожаю логикой.",
-            "mirror": "Копирую стиль противника, переворачиваю смысл.",
-            "sarcasm": "Уничтожаю через иронию и сарказм.",
-            "provocator": "Провоцирую на эмоции, чтобы он ошибся.",
-            "psychologist": "Анализирую поведение с юмором и колкостями.",
-            "chaos": "Абсурдные, но логически связанные ответы.",
-            "statistic": "Показываю статистику по оппоненту."
-        }
-        await query.edit_message_text(
-            f"✅ Режим **{mode_names.get(mode, mode)}** выбран.\n"
-            f"Описание: {mode_descriptions.get(mode, '')}\n\n"
-            f"Продолжайте отправлять сообщения."
-        )
+        await query.edit_message_text("🎭 Выберите режим:", reply_markup=get_mode_keyboard())
         return
 
     if data == "action_tone":
@@ -840,6 +680,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("ℹ️ Нет активной сессии для экспорта.")
         return
 
+    if data == "action_copy_mode":
+        copy_mode[user_id] = not copy_mode.get(user_id, False)
+        status = "включён" if copy_mode[user_id] else "выключен"
+        await query.edit_message_text(f"📋 Режим копирования {status}.")
+        return
+
+    if data == "action_turbo":
+        turbo_mode[user_id] = not turbo_mode.get(user_id, False)
+        status = "включён" if turbo_mode[user_id] else "выключен"
+        await query.edit_message_text(f"⚡ Турбо-режим {status}.")
+        return
+
+    if data == "action_count":
+        await query.edit_message_text("🔢 Выберите количество вариантов:", reply_markup=get_count_keyboard())
+        return
+
     if data == "action_stop":
         await stop_session(update, context)
         return
@@ -847,23 +703,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "action_help":
         await query.edit_message_text(
             "👋 Я — бот-ассистент по троллингу.\n\n"
-            "📌 Как я работаю:\n"
-            "1. Отправьте сообщение оппонента (скопируйте из игры).\n"
-            "2. Я определю цель или попрошу уточнить.\n"
-            "3. Я анализирую тон и предлагаю 5 вариантов ответа.\n"
-            "4. Вы выбираете вариант или генерируете новые.\n\n"
-            "🎭 Режимы:\n"
-            "• Логик — разбор аргументов\n"
-            "• Зеркало — переворот смысла\n"
-            "• Сарказм — ирония\n"
-            "• Провокатор — вызов эмоций\n"
-            "• Психолог — анализ с юмором\n"
-            "• Хаос — абсурдные ответы\n"
-            "• Статистик — статистика по оппоненту\n\n"
+            "🔥 Горячие клавиши:\n"
+            "➕ +текст — сообщение от вас (контекст)\n"
+            "➖ -текст — сообщение от оппонента (анализ)\n\n"
+            "🎭 Режимы: Логик, Зеркало, Сарказм, Провокатор, Психолог, Хаос, Статистик.\n"
             "📊 Тон — анализ агрессии, сарказма, пассивности.\n"
             "📤 Экспорт — выгрузка диалога в CSV.\n"
             "📋 Копирование — чистые ответы без кнопок.\n"
             "⚡ Турбо — отключение задержки.\n"
+            "🔢 Количество — выбор числа вариантов.\n"
             "⏹ Завершить сессию — остановить анализ."
         )
         return
@@ -872,14 +720,120 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("🔙 Возврат в главное меню.", reply_markup=get_main_keyboard())
         return
 
+    if data == "action_change_target":
+        await query.edit_message_text("📝 Введите имя цели: /target <имя>")
+        return
+
+    # === ВЫБОР ВАРИАНТА ===
+    if data.startswith("choose_"):
+        idx = int(data.replace("choose_", ""))
+        options = context.user_data.get("last_options", [])
+        if idx < len(options):
+            if copy_mode.get(user_id, False):
+                await query.edit_message_text(f"📋 {options[idx]}")
+            else:
+                await query.edit_message_text(f"✅ Выбран вариант {idx+1}:\n\n{options[idx]}")
+        return
+
+    # === ЕЩЁ ВАРИАНТЫ ===
+    if data == "action_more":
+        prompt = context.user_data.get("last_prompt", "")
+        if prompt:
+            reply = call_hf_with_fallback(prompt + " Дай ещё варианты (новые).")
+            if reply:
+                count = count_mode.get(user_id, 5)
+                options = reply.split("\n")
+                options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5][:count]
+                context.user_data["last_options"] = options
+                buttons = []
+                for i in range(count):
+                    buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
+                keyboard = [buttons]
+                keyboard.append([
+                    InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
+                    InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+                ])
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                await query.edit_message_text(
+                    f"🎯 Новые варианты:\n\n"
+                    + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
+                    f"\n\nВыберите вариант:",
+                    reply_markup=reply_markup
+                )
+        return
+
+    # === УТОЧНЕНИЕ ОТПРАВИТЕЛЯ ===
+    if data.startswith("sender_"):
+        sender = data.replace("sender_", "")
+        session = session_data.get(user_id)
+        if not session:
+            await query.edit_message_text("❌ Нет активной сессии.")
+            return
+        pending_text = context.user_data.get("pending_message")
+        if not pending_text:
+            await query.edit_message_text("❌ Нет сообщения для обработки.")
+            return
+
+        if sender == "him":
+            sender_confirmed[user_id] = "him"
+            session["history"].append({"role": "opponent", "text": pending_text, "timestamp": datetime.now().isoformat()})
+            await update_weak_points(session.get("target_name"), pending_text)
+            await query.edit_message_text("✅ Сообщение от оппонента сохранено. Генерирую ответ...")
+            await generate_response(update, context, pending_text)
+        elif sender == "me":
+            sender_confirmed[user_id] = "me"
+            session["history"].append({"role": "user", "text": pending_text, "timestamp": datetime.now().isoformat()})
+            await query.edit_message_text("✅ Ваше сообщение сохранено как контекст.")
+        context.user_data.pop("pending_message", None)
+        return
+
+    # === КОЛИЧЕСТВО ВАРИАНТОВ ===
+    if data.startswith("count_"):
+        count = int(data.replace("count_", ""))
+        count_mode[user_id] = count
+        await query.edit_message_text(f"✅ Количество вариантов: {count}")
+        return
+
+    # === РЕЖИМЫ ===
+    if data.startswith("mode_"):
+        mode = data.replace("mode_", "")
+        if user_id in session_data:
+            session_data[user_id]["mode"] = mode
+            save_session_to_db(user_id, session_data[user_id])
+        mode_names = {
+            "logic": "Логик",
+            "mirror": "Зеркало",
+            "sarcasm": "Сарказм",
+            "provocator": "Провокатор",
+            "psychologist": "Психолог",
+            "chaos": "Хаос",
+            "statistic": "Статистик"
+    }
+        mode_descriptions = {
+            "logic": "Разбираю аргументы по косточкам.",
+            "mirror": "Копирую стиль, переворачиваю смысл.",
+            "sarcasm": "Уничтожаю через иронию.",
+            "provocator": "Провоцирую на эмоции.",
+            "psychologist": "Анализирую поведение с юмором.",
+            "chaos": "Абсурдные, но логичные ответы.",
+            "statistic": "Показываю статистику."
+        }
+        await query.edit_message_text(
+            f"✅ Режим **{mode_names.get(mode, mode)}** выбран.\n"
+            f"{mode_descriptions.get(mode, '')}\n\n"
+            f"Продолжайте отправлять сообщения."
+        )
+        return
+
 async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id in session_data:
         del session_data[user_id]
     if user_id in user_sessions:
         del user_sessions[user_id]
+    sender_confirmed.pop(user_id, None)
     await update.message.reply_text(
-        "⏹ Сессия завершена.\nДанные сохранены в историю диалогов.",
+        "⏹ Сессия завершена.\nДанные сохранены.",
         reply_markup=get_main_keyboard()
     )
 
@@ -887,21 +841,10 @@ async def stop_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Я — бот-ассистент по троллингу.\n\n"
-        "📌 Как я работаю:\n"
-        "1. Отправьте сообщение оппонента (скопируйте из игры).\n"
-        "2. Я определю цель или попрошу уточнить.\n"
-        "3. Я анализирую тон и предлагаю варианты ответа.\n"
-        "4. Вы выбираете вариант или генерируете новые.\n\n"
         "🔥 Горячие клавиши:\n"
-        "➕ `+текст` — сообщение от вас (контекст)\n"
-        "➖ `-текст` — сообщение от оппонента (анализ)\n\n"
-        "🎭 Режимы: Логик, Зеркало, Сарказм, Провокатор, Психолог, Хаос, Статистик.\n"
-        "📊 Тон — анализ агрессии, сарказма, пассивности.\n"
-        "📤 Экспорт — выгрузка диалога в CSV.\n"
-        "📋 Копирование — чистые ответы без кнопок.\n"
-        "⚡ Турбо — отключение задержки.\n"
-        "⏹ Завершить сессию — остановить анализ.\n\n"
-        "Нажмите кнопку, чтобы начать:",
+        "➕ +текст — сообщение от вас\n"
+        "➖ -текст — сообщение от оппонента\n\n"
+        "Выберите действие:",
         reply_markup=get_main_keyboard()
     )
 
@@ -919,7 +862,7 @@ async def target_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_session_to_db(user_id, session_data[user_id])
         await update.message.reply_text(
             f"🎯 Цель установлена: {target_name}\n\n"
-            "Теперь отправляйте сообщения, и я буду анализировать их.",
+            "Теперь отправляйте сообщения.",
             reply_markup=get_main_keyboard()
         )
     else:
@@ -940,7 +883,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(handle_callback, pattern=r"^(confirm_|deny_|choose_|mode_|sender_|action_|count_)"))
 
-    logger.info("Бот запущен с полной функциональностью (HF + OpenRouter)...")
+    logger.info("Бот запущен с полной функциональностью...")
     app.run_polling()
 
 if __name__ == "__main__":
