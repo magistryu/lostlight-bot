@@ -600,22 +600,22 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
         f"Варианты:"
     )
 
-# === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
-await update.message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
+    # === ПРОБУЕМ СГЕНЕРИРОВАТЬ ===
+    await update.message.reply_text("⏳ Генерирую ответ...", reply_markup=get_main_keyboard())
 
-logger.info("🔵 Вызов call_hf_with_fallback()")
-logger.info(f"🔵 Промпт: {prompt[:200]}...")
+    logger.info("🔵 Вызов call_hf_with_fallback()")
+    logger.info(f"🔵 Промпт: {prompt[:200]}...")
 
-reply = call_hf_with_fallback(prompt)
+    reply = call_hf_with_fallback(prompt)
 
-logger.info(f"🔵 Ответ от call_hf_with_fallback: {reply}")
+    logger.info(f"🔵 Ответ от call_hf_with_fallback: {reply}")
 
-if not reply:
-    await update.message.reply_text(
-        "⚠️ Не удалось сгенерировать ответ. Попробуйте позже.",
-        reply_markup=get_main_keyboard()
-    )
-    return
+    if not reply:
+        await update.message.reply_text(
+            "⚠️ Не удалось сгенерировать ответ. Попробуйте позже.",
+            reply_markup=get_main_keyboard()
+        )
+        return
 
     options = reply.split("\n")
     options = [o.strip() for o in options if o.strip() and len(o.strip()) > 5]
