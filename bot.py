@@ -606,44 +606,44 @@ async def generate_response(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     context.user_data["last_options"] = options
     context.user_data["last_prompt"] = prompt
 
-strategies = [
-    "Сейчас лучше ответить холодно — он потеряет контроль.",
-    "Используй сарказм — он не выдержит насмешки.",
-    "Бей в логику — у него нет аргументов.",
-    "Спровоцируй его на эмоции — он ошибётся.",
-    "Ответь зеркально — он увидит себя со стороны.",
-    "Используй абсурд — он не поймёт, как реагировать.",
-    "Покажи статистику — это его слабое место."
-]
+    strategies = [
+        "Сейчас лучше ответить холодно — он потеряет контроль.",
+        "Используй сарказм — он не выдержит насмешки.",
+        "Бей в логику — у него нет аргументов.",
+        "Спровоцируй его на эмоции — он ошибётся.",
+        "Ответь зеркально — он увидит себя со стороны.",
+        "Используй абсурд — он не поймёт, как реагировать.",
+        "Покажи статистику — это его слабое место."
+    ]
 
-strategy = random.choice(strategies)
+    strategy = random.choice(strategies)
 
-if copy_mode.get(user_id, False):
+    if copy_mode.get(user_id, False):
+        await update.message.reply_text(
+            f"📋 {options[0]}",
+            reply_markup=get_main_keyboard()
+        )
+        return
+
+    buttons = []
+    for i in range(count):
+        buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
+    keyboard = [buttons]
+    keyboard.append([
+        InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
+        InlineKeyboardButton("🔙 Назад", callback_data="action_back")
+    ])
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
     await update.message.reply_text(
-        f"📋 {options[0]}",
-        reply_markup=get_main_keyboard()
+        f"🎯 Цель: {target_name} | Режим: {mode}\n"
+        f"📊 Тон: {tone}\n\n"
+        f"**Варианты ответа:**\n"
+        + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
+        f"\n\n💡 Стратегия: {strategy}\n\n"
+        f"Выберите вариант или сгенерируйте новые:",
+        reply_markup=reply_markup
     )
-    return
-
-buttons = []
-for i in range(count):
-    buttons.append(InlineKeyboardButton(f"📝 Вариант {i+1}", callback_data=f"choose_{i}"))
-keyboard = [buttons]
-keyboard.append([
-    InlineKeyboardButton("🔄 Ещё", callback_data="action_more"),
-    InlineKeyboardButton("🔙 Назад", callback_data="action_back")
-])
-reply_markup = InlineKeyboardMarkup(keyboard)
-
-await update.message.reply_text(
-    f"🎯 Цель: {target_name} | Режим: {mode}\n"
-    f"📊 Тон: {tone}\n\n"
-    f"**Варианты ответа:**\n"
-    + "\n".join([f"{i+1}️⃣ {options[i]}" for i in range(len(options))]) +
-    f"\n\n💡 Стратегия: {strategy}\n\n"
-    f"Выберите вариант или сгенерируйте новые:",
-    reply_markup=reply_markup
-)
 
 def calculate_degree(text):
     score = 0
